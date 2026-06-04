@@ -8,13 +8,13 @@ MODEL:
   LSTM_PARAMS:
     NUM_LAYERS: 2
     HIDDEN_SIZE: 256
-  E2E: True # Decides if backbone is NOT frozen in training
+  E2E: False # Decides if backbone is NOT frozen in training
   MULTICLASSIFIER: True # Classifier WILL NOT be implemented if E2E=False
   INFERENCE: False
   INFERENCE_WEIGHTS: 'SwinV2LSTM_e2e_raw_mc_V3_sd5_bestMAP.pt'
 # TRAINING PARAMS
 TRAIN:
-  EPOCHS: 8
+  EPOCHS: 10
   LIMIT_DATA_FRACTION: 1 # Limits how much data is used for constructing the train, val, test datasets. 1 = 100%, 5 = 20% etc.
   TRANSFORMS:
     ENDOSCAPES_MEAN: [0.485, 0.456, 0.406]
@@ -43,7 +43,7 @@ TRAIN:
   ACCUMULATION_STEPS: 1
 # SWINV2 BACKBONE PARAMS
 BACKBONE:
-  PRETRAINED: 'swinv2_base_patch4_window12to24_192to384_22kto1k_ft.pth' #'Swin_backbone_no_augm_sd4_bestMAP.pt' - for backbone/E2E use IMGNet weights, for E2E use backbone weights
+  PRETRAINED: 'Swin_backbone_no_augm_sd4_bestMAP.pt' # 'swinv2_base_patch4_window12to24_192to384_22kto1k_ft.pth' - for backbone/E2E use IMGNet weights, for E2E use backbone weights
   DROP_PATH_RATE: 0.2
   DROP_RATE: 0.0
   NUM_CLASSES: 1000
@@ -60,4 +60,7 @@ BACKBONE:
     APE: False
     PATCH_NORM: True
   USE_CHECKPOINT: False
+
+INFERENCE:
+  BATCH_SIZE: 4
   
