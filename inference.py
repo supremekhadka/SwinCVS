@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import warnings
 import os
+import pandas as pd
 
 # Third-party imports
 import torch
@@ -44,8 +45,15 @@ parser.add_argument(
     help="Path to inference config YAML file",
 )
 args = parser.parse_args()
-config_path = args.config_path
+config_path = args.inference_config_path
 config = get_config(config_path, mode="inference")
+input_df = pd.read_csv(config.CSV_PATH)
+
+
+last_index = (len(input_df) // 5) * 5
+label_rows = input_df.iloc[4:last_index:5].reset_index(
+    drop=True
+)  # row index 4, 9, 14, …
 
 seed = config.SEED
 set_deterministic_behaviour(seed)
@@ -69,12 +77,12 @@ print("Full model initialised successfully!\n")
 weights = "weights/" + config.WEIGHTS
 model.load_state_dict(torch.load(weights))
 print(
-    f"Trained SwinCVS weights loaded successfully for INFERENCE - name: {config.MODEL.INFERENCE_WEIGHTS}"
+    f"Trained SwinCVS weights loaded successfully for INFERENCE - name: {config.WEIGHTS}"
 )
-if config.CUDA_ID:
-    model.to("cuda:{CUDA_ID}")
-else:
-    model.to("cuda")
+
+device = f"cuda:{config.CUDA_ID}"
+
+model.to(device)
 
 torch.cuda.empty_cache()
 
@@ -101,7 +109,10 @@ with torch.inference_mode():
         start_time = time.time()
 
         # Get preds
-        samples, targets = samples.to("cuda"), targets.to("cuda")
+        samples, targets = (
+            samples.to(device),
+            targets.to(device),
+        )
 
         outputs_lstm = model(samples)
 
@@ -121,6 +132,7 @@ with torch.inference_mode():
 
         torch.cuda.synchronize()
 
+
 # Calculate metrics
 (
     C1_balanced_accuracy,
@@ -134,7 +146,7 @@ C1_ap, C2_ap, C3_ap, mAP = get_map(test_targets, test_probabilities)
 print("\nTesting results:")
 print(
     "Average balanced accuracy",
-    round((C1_balanced_accuracy + C1_balanced_accuracy + C3_balanced_accuracy) / 3, 4),
+    round((C1_balanced_accuracy + C2_balanced_accuracy + C3_balanced_accuracy) / 3, 4),
 )
 print("C1 bacc", round(C1_balanced_accuracy, 4))
 print("C2 bacc", round(C2_balanced_accuracy, 4))
@@ -173,9 +185,27 @@ inference_results = {
 }
 results_dict["Inference_Results"] = inference_results
 
+
+preds_tensor = torch.cat(test_predictions, dim=0)
+
+output_df = pd.DataFrame(
+    {
+        "vid": label_rows["vid"].values,
+        "frame": label_rows["frame"].astype(str).str.zfill(4).values,
+        "C1": preds_tensor[:, 0].int().tolist(),
+        "C2": preds_tensor[:, 1].int().tolist(),
+        "C3": preds_tensor[:, 2].int().tolist(),
+    }
+)
+
 os.makedirs(pwd / "results" / "inference", exist_ok=True)
 
+csv_out_path = pwd / "results" / "inference" / f"{config.INFERENCE_NAME}_preds.csv"
+output_df.to_csv(csv_out_path, index=False)
+
 with open(
-    pwd / "results" / "inference" / f"{config.INFERENCE_NAME}results.json", "w"
+    pwd / "results" / "inference" / f"{config.INFERENCE_NAME}_results.json", "w"
 ) as file:
     json.dump(results_dict, file, indent=4)
+
+print(f"\nPredictions saved to: {csv_out_path}")

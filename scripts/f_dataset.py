@@ -16,19 +16,29 @@ def get_inference_dataset(config):
     """
     Verify and return inference dataset
     """
-    if str(config.CSV_PATH).endswith(".csv") and Path(config).is_file():
-        csv_path = Path(config)
+    if str(config.CSV_PATH).endswith(".csv") and Path(config.CSV_PATH).is_file():
+        csv_path = Path(config.CSV_PATH)
 
         dataframe = pd.read_csv(csv_path)
 
         sequence_data = []
 
-        for i in range(0, len(dataframe), 5):
+        last_index = (len(dataframe) // 5) * 5
+
+        for i in range(0, last_index, 5):
             data = {}
 
-            five_frames = dataframe["frame"].iloc[i : i + 5].tolist()
+            five_frames = (
+                dataframe[["vid", "frame"]]
+                .apply(
+                    lambda x: str(x["vid"]) + "_" + str(x["frame"]).zfill(4) + ".jpg",
+                    axis=1,
+                )
+                .iloc[i : i + 5]
+                .tolist()
+            )
             classification = list(
-                map(float, dataframe[["C1", "C2", "C3"]].iloc[i + 5].tolist())
+                map(float, dataframe[["C1", "C2", "C3"]].iloc[i + 4].tolist())
             )
 
             for j, frame in enumerate(five_frames):
@@ -50,7 +60,9 @@ def get_inference_dataset(config):
             ]
         )
 
-        dataset = EndoscapesSwinCVS_Dataset(sequence_dataframe, transform_sequence)
+        dataset = EndoscapesSwinCVS_Inference_Dataset(
+            sequence_dataframe, transform_sequence, images_path=config.IMAGES_PATH
+        )
 
         return dataset
     else:
@@ -280,6 +292,57 @@ class EndoscapesSwinCVS_Dataset(Dataset):
         image_f2_path = sequence_info["f2"]
         image_f3_path = sequence_info["f3"]
         image_f4_path = sequence_info["f4"]
+        paths = [
+            image_f0_path,
+            image_f1_path,
+            image_f2_path,
+            image_f3_path,
+            image_f4_path,
+        ]
+
+        image_list = []
+        if self.transforms:
+            seed = random.randint(0, 2**32)
+            for path in paths:
+                image = Image.open(path)
+                torch.manual_seed(seed)
+                random.seed(seed)
+                image = self.transforms(image)
+                image = (image - torch.min(image)) / (
+                    -torch.min(image) + torch.max(image)
+                )
+                image_list.append(image)
+        else:
+            for path in paths:
+                image = Image.open(path)
+                image_list.append(image)
+
+        images = torch.stack(image_list)
+        label = torch.tensor(sequence_info["classification"])
+
+        return images, label
+
+
+class EndoscapesSwinCVS_Inference_Dataset(Dataset):
+    """
+    Dataset creator for SwinCVS - includes 5 frame sequences.
+    """
+
+    def __init__(self, image_dataframe, transform_sequence, images_path):
+        self.image_dataframe = image_dataframe
+        self.transforms = transform_sequence
+        self.images_path = images_path
+
+    def __len__(self):
+        return len(self.image_dataframe)
+
+    def __getitem__(self, idx):
+        sequence_info = self.image_dataframe.iloc[idx]
+        image_f0_path = self.images_path + "/" + str(sequence_info["f0"])
+        image_f1_path = self.images_path + "/" + str(sequence_info["f1"])
+        image_f2_path = self.images_path + "/" + str(sequence_info["f2"])
+        image_f3_path = self.images_path + "/" + str(sequence_info["f3"])
+        image_f4_path = self.images_path + "/" + str(sequence_info["f4"])
         paths = [
             image_f0_path,
             image_f1_path,

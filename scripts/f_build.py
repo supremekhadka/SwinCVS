@@ -25,6 +25,11 @@ def build_inference_model(config):
         pretrained_window_sizes=config.BACKBONE.SWINV2.PRETRAINED_WINDOW_SIZES,
     )
 
+    if not config.MODEL.E2E:
+        # Freeze the backbone weights
+        for param in model.parameters():
+            param.requires_grad = False
+
     model.head = nn.Identity()
 
     swincvs = SwinCVSModel(model, config)
