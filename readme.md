@@ -102,6 +102,7 @@ python3 inference.py \
 | `--output_dir` | yes | Directory outputs are written to. Created automatically if it doesn't exist. |
 | `--eval` | yes | `inference` → `result.csv` (+ `metrics.json` for Endoscapes); `throughput` → `throughput.csv` or `throughput_video.csv`. Run each as a separate invocation — inference and throughput are different measurements over different data paths and are never produced in one pass. |
 | `--throughput_level` | no (default `image`) | Only used with `--eval throughput`. `image` synchronizes CUDA around every frame and writes `throughput.csv`. `video` groups frames by `vid`, times each frame's forward pass with CUDA events, and synchronizes only once per video, writing `throughput_video.csv`. |
+| `--warmup` | no (default `0`) | Run this many forward passes (batch size 1, untimed) before the real pass, to warm up CUDA kernels/caches. The warmup samples are **not** excluded afterwards — the full dataset, including whichever rows were used to warm up, is still processed and included in the outputs. |
 | `--csv_path` | no | Override `CSV_PATH` from the config. |
 | `--images_path` | no | Endoscapes only — override `IMAGES_PATH` from the config. |
 | `--video_root` | no | SAFE only — override `VIDEO_ROOT` from the config. |
