@@ -1,4 +1,3 @@
-INFERENCE_NAME: test_inference_frozen # outputs as {INFERENCE_NAME}_results.json in results/inference
 CSV_PATH: /mnt/Enterprise/supreme_khadka/CVS-AdaptNet/data/CVS_KMCTH/annotations_final.csv
 IMAGES_PATH: /mnt/Enterprise/supreme_khadka/CVS-AdaptNet/data/CVS_KMCTH/all
 
@@ -9,19 +8,19 @@ ENDOSCAPES_STD: [0.229, 0.224, 0.225]
 RESIZE: [384, 683]
 CENTER_CROP: 384
 BATCH_SIZE: 6
-# WEIGHTS: 'SwinV2LSTM_e2e_raw_mc_V3_sd5_bestMAP.pt'
-WEIGHTS: 'SwinCVS_frozen_ENDP_sd5_bestMAP.pt'
 
+# Default weights per mode (--mode e2e|frozen on the CLI selects between these;
+# override either at runtime with --weights)
+WEIGHTS_E2E: 'SwinV2LSTM_e2e_raw_mc_V3_sd5_bestMAP.pt'
+WEIGHTS_FROZEN: 'SwinCVS_frozen_ENDP_sd5_bestMAP.pt'
 
-# SWINCVS MODEL PARAMS
+# SWINCVS MODEL PARAMS (E2E / INFERENCE are set programmatically from --mode)
 MODEL:
   LSTM: True
   LSTM_PARAMS:
     NUM_LAYERS: 2
     HIDDEN_SIZE: 256
-  E2E: False # Set to True if using E2E weights else False for Frozen weights
   MULTICLASSIFIER: True # Classifier WILL NOT be implemented if E2E=False
-  INFERENCE: True
 # SWINV2 BACKBONE PARAMS
 BACKBONE:
   DROP_PATH_RATE: 0.2
