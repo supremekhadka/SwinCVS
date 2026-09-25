@@ -25,8 +25,8 @@ BATCH_SIZE: 4   # only used for --eval inference (--eval throughput forces batch
 
 # Default weights per mode. Override either with --weights on the CLI.
 WEIGHTS_E2E: 'SwinV2LSTM_e2e_raw_mc_V3_sd5_bestMAP.pt'
-# WEIGHTS_FROZEN: 'SwinCVS_frozen_ENDP_sd5_bestMAP.pt'
-WEIGHTS_FROZEN: 'Swin_backbone_no_augm_sd4_bestMAP.pt'
+WEIGHTS_FROZEN: 'SwinCVS_frozen_ENDP_sd5_bestMAP.pt'
+# WEIGHTS_FROZEN: 'Swin_backbone_no_augm_sd4_bestMAP.pt'
 
 # SWINCVS MODEL PARAMS (E2E / INFERENCE are set programmatically from --mode)
 MODEL:
