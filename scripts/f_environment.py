@@ -30,11 +30,18 @@ def verify_results_weights_folder(pwd, mode="train"):
         "Swin_backbone_no_augm_sd4_bestMAP.pt",
         "swinv2_base_patch4_window12to24_192to384_22kto1k_ft.pth",
         "SwinV2LSTM_e2e_raw_mc_V3_sd5_bestMAP.pt",
+        "SwinCVS_frozen_ENDP_sd5_bestMAP.pt",
     ]
     if not all(any(s in item for item in weights) for s in required_weights):
         print("Certain weights missing. Redownloading weights...")
         weights_url = "https://liveuclac-my.sharepoint.com/:u:/g/personal/rmapfmn_ucl_ac_uk/EdedZjlxigtEv67d1v-MkXYBhwUcKVoB5SDsxUVhaMptNg?download=1"
         download_extract_zip(weights_dir, weights_url)
+
+    frozen_endp_weight = weights_dir / "SwinCVS_frozen_ENDP_sd5_bestMAP.pt"
+    if not frozen_endp_weight.exists():
+        print("SwinCVS_frozen_ENDP_sd5_bestMAP.pt missing. Downloading...")
+        frozen_endp_url = "https://huggingface.co/supremekhadka/SwinCVS/resolve/main/SwinCVS_frozen_ENDP_sd5_bestMAP.pt"
+        download_file(frozen_endp_weight, frozen_endp_url)
 
 
 def download_extract_zip(download_path, url):
@@ -86,6 +93,41 @@ def download_extract_zip(download_path, url):
         if zip_file_path.exists():
             zip_file_path.unlink()
             print(f"Cleaned up temporary zip file: {zip_file_path}")
+
+
+def download_file(download_path, url):
+    """
+    Downloads a single file from a given url to a specified path.
+    """
+    download_path = Path(download_path)
+    download_path.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        print(f"Downloading file from {url}...")
+        response = requests.get(url, stream=True)
+        response.raise_for_status()
+
+        total_size = int(response.headers.get("content-length", 0))
+
+        with (
+            open(download_path, "wb") as file,
+            tqdm(
+                desc="Downloading",
+                total=total_size,
+                unit="B",
+                unit_scale=True,
+                unit_divisor=1024,
+            ) as progress,
+        ):
+            for chunk in response.iter_content(chunk_size=8192):
+                file.write(chunk)
+                progress.update(len(chunk))
+        print(f"Downloaded file to {download_path}.")
+
+    except requests.exceptions.RequestException as e:
+        print(f"An error occurred during download: {e}")
+        if download_path.exists():
+            download_path.unlink()
 
 
 def get_config(config_path, mode="train"):

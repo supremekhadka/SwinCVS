@@ -26,27 +26,29 @@ All released weights were **trained on Endoscapes2023 only**. Running inference 
 - Confirm you have cuda enabled. In console type nvidia-smi. Our driver API details are:
 NVIDIA-SMI 550.120 | Driver Version: 550.120 | CUDA Version: 12.4
 - Install runtime API cuda 12.1 - Remember to add to path!
-- Install dependencies:<br>
-conda create --name swincvs python=3.9.19<br>
-conda activate swincvs<br>
-conda install pytorch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1 pytorch-cuda=12.1 -c pytorch -c nvidia<br>
-pip install -r requirements.txt<br>
+- Install dependencies. You may use any python version above 3.9 and PyTorch that supports your cuda version:
+```
+conda create --name swincvs python=3.12
+conda activate swincvs
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu132
+pip install -r requirements.txt
+```
 - Download the model weights:
   ```bash
   python3 download_weights.py
   ```
-  This fetches the same weights zip that `SwinCVS.py` and `inference.py` would otherwise download implicitly on first run (see `verify_results_weights_folder` in `scripts/f_environment.py`), and extracts it into `weights/`. Running it during setup avoids a large, silent download the first time you kick off training or inference — those scripts still check for the weights and will download them if missing, but you shouldn't need to rely on that anymore.
+  This fetches the same weights zip that `SwinCVS.py` and `inference.py` would otherwise download implicitly on first run (see `verify_results_weights_folder` in `scripts/f_environment.py`), plus `SwinCVS_frozen_ENDP_sd5_bestMAP.pt` from [Hugging Face](https://huggingface.co/supremekhadka/SwinCVS), and extracts/places them into `weights/`. Running it during setup avoids a large, silent download the first time you kick off training or inference — those scripts still check for the weights and will download them if missing, but you shouldn't need to rely on that anymore.
 
 ### Setup on Jetson Orin Nano
 
 The desktop install above (conda + a fixed pytorch-cuda build) doesn't apply on Jetson — PyTorch/torchvision there are tied to the JetPack version, not a generic CUDA version, so check your JetPack version first and match the Python and PyTorch versions to it rather than following the versions above.
 
-- Check your JetPack version (`apt-cache show nvidia-jetpack` or `cat /etc/nv_tegra_release`), then look up the Python and PyTorch build it expects — JetPack ships a specific Python version and needs a matching PyTorch wheel from NVIDIA/PyTorch's Jetson index, not the desktop `pytorch-cuda` conda package.
+- Check your JetPack version (`apt-cache show nvidia-jetpack` or `cat /etc/nv_tegra_release`), then look up the Python and PyTorch build it expects — JetPack ships a specific Python version and needs a matching PyTorch wheel from NVIDIA/PyTorch's Jetson index.
 - For **JetPack 7.2**, that means **Python 3.12**, and PyTorch/torchvision installed via:
   ```bash
   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu132
   ```
-- After that, install the rest of the dependencies as usual: `pip install -r requirements.txt` (drop `torch`/`torchvision` from that step if `requirements.txt` pins different versions, so the Jetson-specific wheel above isn't overwritten).
+- After that, install the rest of the dependencies as usual: `pip install -r requirements.txt`.
 - If you're on a different JetPack version, don't reuse the `cu132` wheel above as-is — re-check the matching Python/CUDA combination for your JetPack release before installing.
 - Then download the weights as above: `python3 download_weights.py`.
 
