@@ -90,10 +90,10 @@ python3 inference.py \
   --dataset {endoscapes,safe} \
   --config_path <path to config> \
   --mode {e2e,frozen} \
-  --output_dir <output directory> \
-  --eval {inference,throughput} \
-  --throughput_level {image,video}
+  --output_dir <output directory>
 ```
+
+A single pass (batch size 1, over every video) reports predictions, per-video throughput and resource usage together, so there are no separate inference/throughput modes.
 
 | Flag | Required | Meaning |
 |---|---|---|
@@ -102,46 +102,58 @@ python3 inference.py \
 | `--mode` | yes | `e2e` (un-frozen backbone) or `frozen` (frozen backbone). Picks `WEIGHTS_E2E` / `WEIGHTS_FROZEN` from the config. |
 | `--weights` | no | Override the weights file (path, or filename under `weights/`). Defaults to the config's `WEIGHTS_E2E`/`WEIGHTS_FROZEN` for the chosen `--mode`. |
 | `--output_dir` | yes | Directory outputs are written to. Created automatically if it doesn't exist. |
-| `--eval` | yes | `inference` → `result.csv` (+ `metrics.json` for Endoscapes); `throughput` → `throughput.csv` or `throughput_video.csv`. Run each as a separate invocation — inference and throughput are different measurements over different data paths and are never produced in one pass. |
-| `--throughput_level` | no (default `image`) | Only used with `--eval throughput`. `image` synchronizes CUDA around every frame and writes `throughput.csv`. `video` groups frames by `vid`, times each frame's forward pass with CUDA events, and synchronizes only once per video, writing `throughput_video.csv`. |
-| `--warmup` | no (default `0`) | Run this many forward passes (batch size 1, untimed) before the real pass, to warm up CUDA kernels/caches. The warmup samples are **not** excluded afterwards — the full dataset, including whichever rows were used to warm up, is still processed and included in the outputs. |
+| `--warmup` | no (default `0`) | Run this many forward passes (batch size 1, untimed) before the measured pass, to warm up CUDA kernels/caches. The warmup samples are **not** excluded afterwards — the full dataset is still processed and included in the outputs. Resource sampling covers the warmup. |
 | `--csv_path` | no | Override `CSV_PATH` from the config. |
 | `--images_path` | no | Endoscapes only — override `IMAGES_PATH` from the config. |
 | `--video_root` | no | SAFE only — override `VIDEO_ROOT` from the config. |
 
-`--eval throughput` forces a batch size of 1 internally regardless of `--throughput_level`, since timing accurately requires it — batching would only give an averaged number.
+Inference always runs at batch size 1 so per-frame timing is exact; batching would only give an averaged number.
 
-For SAFE, both `--eval inference` and `--eval throughput` read from the same 1fps-sampled `VIDEO_ROOT`/`CSV_PATH` (`config/infer_safe.yaml`). This differs from the `cvs`/`CVS-AdaptNet` repos, which run inference on 5fps frames and throughput on 1fps frames: here, every prediction needs the 4 frames immediately preceding the current one to build its input sequence, so 5fps sampling wouldn't give a valid contiguous window for either measurement.
+For SAFE, `VIDEO_ROOT`/`CSV_PATH` (`config/infer_safe.yaml`) are the 1fps-sampled frames and CSV. This differs from the `cvs`/`CVS-AdaptNet` repos, which use the 5fps frames: here, every prediction needs the 4 frames immediately preceding the keyframe to build its input sequence, and only `metadata_1fps.csv` marks keyframes (`is_ds_keyframe`), so 5fps sampling wouldn't give a valid contiguous window.
+
+To run both modes on SAFE in one go, use `run_safe_inference_all.py`. It writes to `outputs/pretrained/<device>/safe/all/<mode>/` (`<device>` is auto-detected as `jetson_orin_nano` or `nitro5_1650ti`; override with `MACHINE_TAG`).
 
 ### Examples
 
 ```bash
-# Endoscapes, frozen backbone, inference
+# Endoscapes, frozen backbone
 python3 inference.py --dataset endoscapes --config_path config/infer.yaml \
-  --mode frozen --output_dir results/endoscapes_inference_01 --eval inference
+  --mode frozen --output_dir results/endoscapes_01
 
-# Endoscapes, frozen backbone, image-level throughput
-python3 inference.py --dataset endoscapes --config_path config/infer.yaml \
-  --mode frozen --output_dir results/endoscapes_throughput_01 --eval throughput --throughput_level image
-
-# SAFE, end-to-end backbone, inference
+# SAFE, end-to-end backbone
 python3 inference.py --dataset safe --config_path config/infer_safe.yaml \
-  --mode e2e --output_dir results/safe_inference_01 --eval inference
+  --mode e2e --output_dir results/safe_01
 
-# SAFE, video-level throughput, weights overridden at the CLI
+# SAFE, weights overridden at the CLI
 python3 inference.py --dataset safe --config_path config/infer_safe.yaml \
   --mode frozen --weights SwinCVS_frozen_ENDP_sd5_bestMAP.pt \
-  --output_dir results/safe_throughput_01 --eval throughput --throughput_level video
+  --output_dir results/safe_02
+
+# SAFE, both modes, into outputs/pretrained/<device>/safe/all/{e2e,frozen}/
+./run_safe_inference_all.py
 ```
 
 ### Outputs
 
-- **`result.csv`** (`--eval inference`): every input column preserved for each row evaluated, plus `Conf_C1`, `Conf_C2`, `Conf_C3` — the model's sigmoid confidences for each CVS criterion.
+Written to `--output_dir`:
+
+- **`result.csv`**: every input column preserved for each row evaluated, plus `Conf_C1`, `Conf_C2`, `Conf_C3` — the model's sigmoid confidences for each CVS criterion.
   - Endoscapes: one row per 5-frame-window label (as in the original pipeline).
   - SAFE: one row per `is_ds_keyframe == True` row that had a full, contiguous 5-frame window available (see format below); keyframes without one are dropped and reported in the run log.
-- **`metrics.json`** (Endoscapes only, `--eval inference`): `avg_bal_acc`, `C1_bacc`/`C2_bacc`/`C3_bacc`, `avg_map`, `C1_map`/`C2_map`/`C3_map`, computed against ground truth.
-- **`throughput.csv`** (`--eval throughput --throughput_level image`): `vid_id`, `vid`, `frame`, `inference_time_ms`, `latency_time_ms` — one row per evaluated frame. `inference_time_ms` is the model forward pass only (GPU-synchronised every frame); `latency_time_ms` is end-to-end (image load + transform + device transfer + forward + sigmoid).
-- **`throughput_video.csv`** (`--eval throughput --throughput_level video`): one row per `vid` with `vid_id`, `vid`, `num_frames`, `inference_time_ms`, `latency_time_ms`, `frame_inference_time_ms`, `frame_latency_time_ms` — the last two are the video totals divided by `num_frames`. `inference_time_ms` is measured per frame with CUDA events but only synchronized once at the end of the video; `latency_time_ms` covers the whole video end-to-end.
+- **`metrics.json`** (Endoscapes only): `avg_bal_acc`, `C1_bacc`/`C2_bacc`/`C3_bacc`, `avg_map`, `C1_map`/`C2_map`/`C3_map`, computed against ground truth.
+- **`throughput.csv`**: one row per `vid` with `vid_id`, `vid`, `num_frames`, `inference_time_ms`, `latency_time_ms`, `frame_inference_time_ms`, `frame_latency_time_ms` (the video totals divided by `num_frames`) and `frame_inference_time_ms_min`/`_max`/`_std`. `inference_time_ms` is the sum of per-frame forward times measured with CUDA events; CUDA is synchronized only once per video (video boundary). `latency_time_ms` covers the whole video end-to-end (image load + transform + device transfer + forward + sigmoid).
+- **`resources/peak.csv`**: one row, `peak_memory_mb`, `peak_power_w`.
+- **`resources/resource.csv`**: the sampled time series `time_s`, `memory_mb`, `power_w`, covering warm-up and the full run.
+
+Resource usage is sampled in the background over the whole run (including
+warm-up), GPU-only. Memory comes from CUDA's allocator counters
+(`torch.cuda.memory_allocated`/`max_memory_allocated`), so it is only what
+this process holds on the GPU, including on Jetson's unified memory. Power is
+auto-detected: on Jetson (`tegrastats` present) it is the `VDD_CPU_GPU_CV`
+rail, the closest proxy available on Orin Nano (GPU + CPU + deep learning
+accelerator cores, not pure GPU power); on a desktop GPU (`nvidia-smi`
+present) it is `power.draw`, which is GPU-only. If neither binary is on
+`PATH`, power samples stay empty.
 
 ### Data formats
 
@@ -164,6 +176,8 @@ For every row with `is_ds_keyframe == True`, the 4 immediately preceding rows in
 
 - `download_weights.py` — explicit setup-time weights download (calls the same `verify_results_weights_folder` used implicitly by `SwinCVS.py` / `inference.py`).
 - `inference.py` — unified inference entrypoint (`--dataset endoscapes|safe`), described above.
+- `run_safe_inference_all.py` — runs `inference.py` on SAFE for `e2e` and `frozen`.
+- `scripts/resource_monitor.py` — background GPU memory/power sampler used by `inference.py`.
 - `scripts/f_dataset_safe.py` — SAFE-format dataset/dataloader construction (keyframe-based sequencing, `VIDEO_ROOT/<vid>/<frame>.jpg` image paths). Independent of `scripts/f_dataset.py`, which remains the untouched Endoscapes pipeline used by both `SwinCVS.py` (training) and `inference.py --dataset endoscapes`.
 - `config/infer.yaml` — Endoscapes inference config. `MODEL.E2E` was removed in favour of the `--mode` CLI flag; `WEIGHTS_E2E`/`WEIGHTS_FROZEN` added so `--mode` can select the right weights file.
 - `config/infer_safe.yaml` — SAFE inference config, same `--mode`/weights convention, `CSV_PATH` + `VIDEO_ROOT` instead of `CSV_PATH` + `IMAGES_PATH`.
