@@ -3,36 +3,35 @@ Run SwinCVS inference on either the Endoscapes dataset (original pipeline,
 with ground-truth metrics) or the SAFE dataset (keyframe-flag csv, no
 ground-truth metrics assumed - confidences only), selected via --dataset.
 
-Frozen vs. E2E mode, the output directory, and which evaluation to run are
-all CLI flags so one config per dataset can be reused across runs:
+Frozen vs. E2E mode and the output directory are CLI flags so one config per
+dataset can be reused across runs:
 
     python3 inference.py --dataset endoscapes --config_path config/infer.yaml \
-        --mode frozen --output_dir results/endoscapes_inference_01 --eval inference
-
-    python3 inference.py --dataset endoscapes --config_path config/infer.yaml \
-        --mode frozen --output_dir results/endoscapes_throughput_01 --eval throughput --throughput_level image
+        --mode frozen --output_dir results/endoscapes_01
 
     python3 inference.py --dataset safe --config_path config/infer_safe.yaml \
-        --mode frozen --output_dir results/safe_inference_01 --eval inference
+        --mode frozen --output_dir results/safe_01
 
---eval inference  -> result.csv (endoscapes: also metrics.json with mAP / balanced accuracy)
---eval throughput -> throughput.csv (--throughput_level image, per-frame, forces batch size 1) or
-                     throughput_video.csv (--throughput_level video, timed with CUDA events,
-                     synchronized once per video, forces batch size 1)
+A single pass (batch size 1, over every video) reports predictions,
+per-video throughput and resource usage together, writing under --output_dir:
 
-Inference and throughput are always run as separate invocations - they are
-different measurements and are never produced in one pass.
+- result.csv (endoscapes: also metrics.json with mAP / balanced accuracy)
+- throughput.csv: one row per video; frames are timed with CUDA events and
+  CUDA is synchronized only at video boundaries (once per video).
+- resources/peak.csv, resources/resource.csv: GPU-only peak and sampled
+  memory/power over the whole run, see scripts/resource_monitor.py.
 
 Both modes read from the same VIDEO_ROOT/CSV_PATH: for SAFE this is the
 1fps-sampled frames, since each prediction needs the 4 frames preceding the
-current one to build its input sequence, and 5fps sampling wouldn't give a
-valid contiguous window.
+keyframe to build its input sequence and only the 1fps csv marks keyframes
+(`is_ds_keyframe`).
 """
 
 print("Importing libraries...")
 # Standard library imports
 import argparse
 import json
+import statistics
 import time
 from pathlib import Path
 import warnings
@@ -41,18 +40,19 @@ import warnings
 import torch
 import numpy as np
 import pandas as pd
-from torch.utils.data import DataLoader, Subset
+from tqdm import tqdm
 
 # Local imports
 from scripts.f_environment import get_config, set_deterministic_behaviour
 from scripts.f_build import build_inference_model
 from scripts.f_metrics import get_map, get_balanced_accuracies
+from scripts.resource_monitor import ResourceMonitor
 
 # Endoscapes pipeline (untouched)
-from scripts.f_dataset import get_inference_dataset, get_inference_dataloader
+from scripts.f_dataset import get_inference_dataset
 
 # SAFE pipeline
-from scripts.f_dataset_safe import get_safe_inference_dataset, get_safe_inference_dataloader
+from scripts.f_dataset_safe import get_safe_inference_dataset
 
 warnings.filterwarnings("ignore")
 
@@ -81,20 +81,10 @@ def parse_args():
         help="Directory to write outputs into. Created if it doesn't exist.",
     )
     parser.add_argument(
-        "--eval", type=str, required=True, choices=["inference", "throughput"],
-        help="inference -> result.csv (+ metrics.json for endoscapes); throughput -> throughput.csv/throughput_video.csv. "
-             "Run each as a separate invocation.",
-    )
-    parser.add_argument(
-        "--throughput_level", type=str, default="image", choices=["image", "video"],
-        help="Only used with --eval throughput. image -> synchronize CUDA every frame, write throughput.csv "
-             "(default). video -> synchronize once per video via CUDA events, write throughput_video.csv.",
-    )
-    parser.add_argument(
         "--warmup", type=int, default=0,
-        help="Run this many forward passes (batch size 1) before the timed/evaluated run, to warm up "
+        help="Run this many forward passes (batch size 1) before the measured run, to warm up "
              "CUDA kernels and caches. Images used for warmup are NOT excluded afterwards - the full "
-             "evaluation still runs over every row, including whichever ones were used to warm up.",
+             "run still goes over every row. Resource sampling covers the warmup too.",
     )
     # Optional per-dataset path overrides, so the config doesn't need editing between runs
     parser.add_argument("--csv_path", type=str, default=None, help="Override config.CSV_PATH")
@@ -143,151 +133,62 @@ def load_config(args):
     return config
 
 
-def run_inference_loop(model, dataloader, device, has_targets, do_throughput, meta_df=None):
+def run_video_pass(model, dataset, device, meta_df, has_targets):
     """
-    Shared timing/forward-pass loop for both datasets.
-    has_targets=True: dataloader yields (samples, targets); targets are collected too (endoscapes).
-    has_targets=False: dataloader yields samples only (safe).
-    """
-    all_probs = []
-    all_targets = [] if has_targets else None
-    throughput_rows = []
-
-    len_dataloader = len(dataloader)
-    row_cursor = 0
-    data_iter = iter(dataloader)
-    with torch.inference_mode():
-        for step in range(len_dataloader):
-            print(f"Processing batch: {step + 1:04}/{len_dataloader:04}", end="\r")
-
-            t_pre_start = time.perf_counter()
-            batch = next(data_iter)  # preprocessing happens here (num_workers=0)
-            if has_targets:
-                samples, targets = batch
-            else:
-                samples, targets = batch, None
-            samples = samples.to(device, non_blocking=True)
-            if device.startswith("cuda"):
-                torch.cuda.synchronize()
-            t_model_start = time.perf_counter()
-
-            outputs = model(samples)
-
-            if device.startswith("cuda"):
-                torch.cuda.synchronize()
-            t_model_end = time.perf_counter()
-
-            probs = torch.sigmoid(outputs)
-            probs_cpu = probs.to("cpu")
-            t_post_end = time.perf_counter()
-
-            all_probs.append(probs_cpu)
-            if has_targets:
-                all_targets.append(targets.to("cpu"))
-
-            if do_throughput:
-                inference_time_ms = (t_model_end - t_model_start) * 1000.0
-                latency_time_ms = (t_post_end - t_pre_start) * 1000.0
-                n = probs_cpu.shape[0]
-                for i in range(n):
-                    meta_row = meta_df.iloc[row_cursor + i]
-                    throughput_rows.append(
-                        {
-                            "vid_id": meta_row.get("vid_id"),
-                            "vid": meta_row.get("vid"),
-                            "frame": meta_row.get("frame"),
-                            # batch_size is forced to 1 whenever throughput is measured,
-                            # so these are true per-sample timings.
-                            "inference_time_ms": round(inference_time_ms, 3),
-                            "latency_time_ms": round(latency_time_ms, 3),
-                        }
-                    )
-            row_cursor += probs_cpu.shape[0]
-
-    print()
-    all_probs = torch.cat(all_probs, dim=0)
-    if has_targets:
-        all_targets = torch.cat(all_targets, dim=0)
-    throughput_df = pd.DataFrame(throughput_rows) if do_throughput else None
-    return all_probs, all_targets, throughput_df
-
-
-def warmup_model(model, dataset, device, n_warmup):
-    """
-    Run `n_warmup` forward passes (batch size 1, untimed, predictions discarded)
-    before the real evaluation loop, to warm up CUDA kernels/caches so the
-    first few timed samples aren't penalised by one-off initialisation cost.
-
-    Deliberately reuses samples straight out of `dataset` rather than dummy
-    tensors, so the warmup forward passes see real images end-to-end. Those
-    same samples are NOT dropped from the evaluation afterwards - the run
-    that follows still iterates over the whole dataset.
-    """
-    if n_warmup <= 0:
-        return
-
-    n_warmup = min(n_warmup, len(dataset))
-    print(f"Warming up with {n_warmup} sample(s)...")
-    warmup_loader = DataLoader(
-        Subset(dataset, list(range(n_warmup))),
-        batch_size=1,
-        shuffle=False,
-        num_workers=0,
-    )
-    with torch.inference_mode():
-        for batch in warmup_loader:
-            samples = batch[0] if isinstance(batch, (list, tuple)) else batch
-            samples = samples.to(device, non_blocking=True)
-            model(samples)
-    if device.startswith("cuda"):
-        torch.cuda.synchronize()
-    print("Warmup complete.")
-
-
-def run_throughput_video_level(model, dataset, device, meta_df, has_targets):
-    """
-    Video-level throughput: times each frame's forward pass with CUDA events
-    (no per-frame synchronize), synchronizing only once per video. Returns one
-    row per `vid` with total and per-frame-amortized timings, matching the
-    throughput_video.csv format used by the cvs/CVS-AdaptNet repos.
+    Single pass over every video (batch size 1): each frame's forward pass is
+    timed with CUDA events (no per-frame synchronize) and CUDA is synchronized
+    only once per video. Returns (probs, targets, throughput_df) with probs/
+    targets in dataset order and one throughput row per `vid`.
     """
     is_cuda = device.startswith("cuda")
+    probs = [None] * len(meta_df)
+    targets = [None] * len(meta_df) if has_targets else None
     rows = []
-    for vid, group in meta_df.groupby("vid", sort=False):
+    for vid, group in tqdm(meta_df.groupby("vid", sort=False), desc="Processing videos"):
         indices = group.index.tolist()
         vid_id = group["vid_id"].iloc[0] if "vid_id" in group.columns else None
 
-        start_events, end_events = [], []
+        start_events, end_events, outputs = [], [], []
+        if is_cuda:
+            torch.cuda.synchronize()
         t_video_start = time.perf_counter()
         with torch.inference_mode():
             for idx in indices:
-                item = dataset[idx]
-                sample = item[0] if has_targets else item
+                item = dataset[idx]  # preprocessing happens here, on the main thread
+                if has_targets:
+                    sample, target = item
+                    targets[idx] = target
+                else:
+                    sample = item
                 sample = sample.unsqueeze(0).to(device, non_blocking=True)
 
                 if is_cuda:
                     start_evt = torch.cuda.Event(enable_timing=True)
                     end_evt = torch.cuda.Event(enable_timing=True)
                     start_evt.record()
-                    model(sample)
+                    out = model(sample)
                     end_evt.record()
                     start_events.append(start_evt)
                     end_events.append(end_evt)
                 else:
                     t0 = time.perf_counter()
-                    model(sample)
+                    out = model(sample)
                     start_events.append(t0)
                     end_events.append(time.perf_counter())
+                outputs.append(out)
 
-        if is_cuda:
-            torch.cuda.synchronize()
-            inference_times_ms = [s.elapsed_time(e) for s, e in zip(start_events, end_events)]
-        else:
-            inference_times_ms = [(e - s) * 1000.0 for s, e in zip(start_events, end_events)]
+            if is_cuda:
+                torch.cuda.synchronize()
+                frame_times_ms = [s.elapsed_time(e) for s, e in zip(start_events, end_events)]
+            else:
+                frame_times_ms = [(e - s) * 1000.0 for s, e in zip(start_events, end_events)]
+
+            for idx, out in zip(indices, outputs):
+                probs[idx] = torch.sigmoid(out).to("cpu")
         t_video_end = time.perf_counter()
 
         num_frames = len(indices)
-        total_inference_time_ms = sum(inference_times_ms)
+        total_inference_time_ms = sum(frame_times_ms)
         total_latency_time_ms = (t_video_end - t_video_start) * 1000.0
         rows.append(
             {
@@ -298,37 +199,69 @@ def run_throughput_video_level(model, dataset, device, meta_df, has_targets):
                 "latency_time_ms": round(total_latency_time_ms, 3),
                 "frame_inference_time_ms": round(total_inference_time_ms / num_frames, 3),
                 "frame_latency_time_ms": round(total_latency_time_ms / num_frames, 3),
+                "frame_inference_time_ms_min": round(min(frame_times_ms), 3),
+                "frame_inference_time_ms_max": round(max(frame_times_ms), 3),
+                "frame_inference_time_ms_std": round(
+                    statistics.pstdev(frame_times_ms) if num_frames > 1 else 0.0, 3
+                ),
             }
         )
-    return pd.DataFrame(rows)
+
+    probs = torch.cat(probs, dim=0)
+    if has_targets:
+        targets = torch.stack([torch.as_tensor(t) for t in targets], dim=0)
+    return probs, targets, pd.DataFrame(rows)
 
 
-def write_throughput(args, output_dir, model, dataset, device, dataloader, meta_df, has_targets):
-    if args.throughput_level == "image":
-        _, _, throughput_df = run_inference_loop(
-            model, dataloader, device, has_targets=has_targets, do_throughput=True, meta_df=meta_df
-        )
-        throughput_path = output_dir / "throughput.csv"
-        throughput_df.to_csv(throughput_path, index=False)
-        print(f"Throughput saved to: {throughput_path}")
-        print(
-            f"Mean inference time: {throughput_df['inference_time_ms'].mean():.2f} ms | "
-            f"Mean latency: {throughput_df['latency_time_ms'].mean():.2f} ms"
-        )
-    else:
-        throughput_video_df = run_throughput_video_level(model, dataset, device, meta_df, has_targets)
-        throughput_path = output_dir / "throughput_video.csv"
-        throughput_video_df.to_csv(throughput_path, index=False)
-        print(f"Throughput saved to: {throughput_path}")
-        print(
-            f"Mean per-frame inference time: {throughput_video_df['frame_inference_time_ms'].mean():.2f} ms | "
-            f"Mean per-frame latency: {throughput_video_df['frame_latency_time_ms'].mean():.2f} ms"
-        )
+def warmup_model(model, dataset, device, n_warmup):
+    """
+    Run `n_warmup` forward passes (batch size 1, untimed, predictions discarded)
+    before the real run, to warm up CUDA kernels/caches so the first few timed
+    samples aren't penalised by one-off initialisation cost.
+
+    Deliberately reuses samples straight out of `dataset` rather than dummy
+    tensors, so the warmup forward passes see real images end-to-end. Those
+    same samples are NOT dropped from the run afterwards.
+    """
+    if n_warmup <= 0:
+        return
+
+    n_warmup = min(n_warmup, len(dataset))
+    print(f"Warming up with {n_warmup} sample(s)...")
+    with torch.inference_mode():
+        for idx in range(n_warmup):
+            item = dataset[idx]
+            sample = item[0] if isinstance(item, (list, tuple)) else item
+            model(sample.unsqueeze(0).to(device, non_blocking=True))
+    if device.startswith("cuda"):
+        torch.cuda.synchronize()
+    print("Warmup complete.")
+
+
+def write_outputs(output_dir, throughput_df, resource_monitor):
+    throughput_path = output_dir / "throughput.csv"
+    throughput_df.to_csv(throughput_path, index=False)
+    print(f"Throughput saved to: {throughput_path}")
+    print(
+        f"Mean per-frame inference time: {throughput_df['frame_inference_time_ms'].mean():.2f} ms | "
+        f"Mean per-frame latency: {throughput_df['frame_latency_time_ms'].mean():.2f} ms"
+    )
+
+    resources_dir = output_dir / "resources"
+    resources_dir.mkdir(parents=True, exist_ok=True)
+    peak_path = resources_dir / "peak.csv"
+    pd.DataFrame([{
+        "peak_memory_mb": resource_monitor.peak_memory_mb(),
+        "peak_power_w": resource_monitor.peak_power_w(),
+    }]).to_csv(peak_path, index=False)
+    print(f"Peak resource usage saved to: {peak_path}")
+    resource_path = resources_dir / "resource.csv"
+    pd.DataFrame(resource_monitor.samples).to_csv(resource_path, index=False)
+    print(f"Resource usage samples saved to: {resource_path}")
 
 
 def run_endoscapes(config, args, model, device, output_dir):
     dataset = get_inference_dataset(config)
-    warmup_model(model, dataset, device, args.warmup)
 
     input_df = pd.read_csv(config.CSV_PATH)
     last_index = (len(input_df) // 5) * 5
@@ -338,68 +271,66 @@ def run_endoscapes(config, args, model, device, output_dir):
     if "vid_id" in input_df.columns:
         meta_df["vid_id"] = input_df.iloc[4:last_index:5]["vid_id"].reset_index(drop=True)
 
-    if args.eval == "inference":
-        dataloader = get_inference_dataloader(
-            type("C", (), {"BATCH_SIZE": config.BATCH_SIZE})(), dataset
-        )
-        probs, targets, _ = run_inference_loop(
-            model, dataloader, device, has_targets=True, do_throughput=False
-        )
-        preds = torch.round(probs)
+    resource_monitor = ResourceMonitor(torch.device(device))
+    resource_monitor.start()
+    warmup_model(model, dataset, device, args.warmup)
+    probs, targets, throughput_df = run_video_pass(
+        model, dataset, device, meta_df, has_targets=True
+    )
+    resource_monitor.stop()
 
-        (C1_bacc, C2_bacc, C3_bacc, total_bacc) = get_balanced_accuracies([targets], [preds])
-        C1_ap, C2_ap, C3_ap, mAP = get_map([targets], [probs])
+    preds = torch.round(probs)
 
-        metrics = {
-            "avg_bal_acc": round(total_bacc, 4),
-            "C1_bacc": round(C1_bacc, 4),
-            "C2_bacc": round(C2_bacc, 4),
-            "C3_bacc": round(C3_bacc, 4),
-            "avg_map": round(mAP, 4),
-            "C1_map": round(C1_ap, 4),
-            "C2_map": round(C2_ap, 4),
-            "C3_map": round(C3_ap, 4),
-        }
-        print("\nTesting results:", metrics)
-        with open(output_dir / "metrics.json", "w") as f:
-            json.dump(metrics, f, indent=4)
+    (C1_bacc, C2_bacc, C3_bacc, total_bacc) = get_balanced_accuracies([targets], [preds])
+    C1_ap, C2_ap, C3_ap, mAP = get_map([targets], [probs])
 
-        result_df = label_rows.copy()
-        result_df["Conf_C1"] = probs[:, 0].tolist()
-        result_df["Conf_C2"] = probs[:, 1].tolist()
-        result_df["Conf_C3"] = probs[:, 2].tolist()
-        result_path = output_dir / "result.csv"
-        result_df.to_csv(result_path, index=False)
-        print(f"Predictions saved to: {result_path}")
-        print(f"Metrics saved to: {output_dir / 'metrics.json'}")
-    else:
-        dataloader = get_inference_dataloader(type("C", (), {"BATCH_SIZE": 1})(), dataset)
-        write_throughput(args, output_dir, model, dataset, device, dataloader, meta_df, has_targets=True)
+    metrics = {
+        "avg_bal_acc": round(total_bacc, 4),
+        "C1_bacc": round(C1_bacc, 4),
+        "C2_bacc": round(C2_bacc, 4),
+        "C3_bacc": round(C3_bacc, 4),
+        "avg_map": round(mAP, 4),
+        "C1_map": round(C1_ap, 4),
+        "C2_map": round(C2_ap, 4),
+        "C3_map": round(C3_ap, 4),
+    }
+    print("\nTesting results:", metrics)
+    with open(output_dir / "metrics.json", "w") as f:
+        json.dump(metrics, f, indent=4)
+
+    result_df = label_rows.copy()
+    result_df["Conf_C1"] = probs[:, 0].tolist()
+    result_df["Conf_C2"] = probs[:, 1].tolist()
+    result_df["Conf_C3"] = probs[:, 2].tolist()
+    result_path = output_dir / "result.csv"
+    result_df.to_csv(result_path, index=False)
+    print(f"Predictions saved to: {result_path}")
+    print(f"Metrics saved to: {output_dir / 'metrics.json'}")
+    write_outputs(output_dir, throughput_df, resource_monitor)
 
 
 def run_safe(config, args, model, device, output_dir):
     dataset, meta_df = get_safe_inference_dataset(config)
     if len(dataset) == 0:
         raise RuntimeError("No usable 5-frame keyframe sequences were found in the csv.")
+
+    resource_monitor = ResourceMonitor(torch.device(device))
+    resource_monitor.start()
     warmup_model(model, dataset, device, args.warmup)
+    probs, _, throughput_df = run_video_pass(
+        model, dataset, device, meta_df, has_targets=False
+    )
+    resource_monitor.stop()
+    assert probs.shape[0] == len(meta_df), "Prediction / metadata row count mismatch"
 
-    if args.eval == "inference":
-        dataloader = get_safe_inference_dataloader(config, dataset, batch_size=config.BATCH_SIZE, num_workers=0)
-        probs, _, _ = run_inference_loop(
-            model, dataloader, device, has_targets=False, do_throughput=False
-        )
-        assert probs.shape[0] == len(meta_df), "Prediction / metadata row count mismatch"
-
-        result_df = meta_df.copy()
-        result_df["Conf_C1"] = probs[:, 0].tolist()
-        result_df["Conf_C2"] = probs[:, 1].tolist()
-        result_df["Conf_C3"] = probs[:, 2].tolist()
-        result_path = output_dir / "result.csv"
-        result_df.to_csv(result_path, index=False)
-        print(f"Predictions saved to: {result_path}")
-    else:
-        dataloader = get_safe_inference_dataloader(config, dataset, batch_size=1, num_workers=0)
-        write_throughput(args, output_dir, model, dataset, device, dataloader, meta_df, has_targets=False)
+    result_df = meta_df.copy()
+    result_df["Conf_C1"] = probs[:, 0].tolist()
+    result_df["Conf_C2"] = probs[:, 1].tolist()
+    result_df["Conf_C3"] = probs[:, 2].tolist()
+    result_path = output_dir / "result.csv"
+    result_df.to_csv(result_path, index=False)
+    print(f"Predictions saved to: {result_path}")
+    write_outputs(output_dir, throughput_df, resource_monitor)
 
 
 def main():
@@ -426,7 +357,7 @@ def main():
     if device.startswith("cuda"):
         torch.cuda.empty_cache()
 
-    print(f"\nRunning {args.eval}" + (f" ({args.throughput_level}-level)" if args.eval == "throughput" else ""))
+    print("\nRunning inference + throughput + resource usage")
     if args.dataset == "endoscapes":
         run_endoscapes(config, args, model, device, output_dir)
     else:

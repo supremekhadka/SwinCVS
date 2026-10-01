@@ -4,7 +4,7 @@
 # Per-run choices that used to live in a config file (train/frozen mode,
 # output directory) are now CLI arguments to inference_safe.py so a single
 # config can be reused for both modes and any output location:
-#   --mode {e2e,frozen}   --output_dir <dir>   --eval {inference,throughput}   --throughput_level {image,video}
+#   --mode {e2e,frozen}   --output_dir <dir>
 #
 # This file only needs to point at the data. Everything else (transforms,
 # backbone architecture) is fixed by how the released weights were trained.
@@ -21,7 +21,7 @@ ENDOSCAPES_MEAN: [0.485, 0.456, 0.406]
 ENDOSCAPES_STD: [0.229, 0.224, 0.225]
 RESIZE: [384, 683]
 CENTER_CROP: 384
-BATCH_SIZE: 1   # only used for --eval inference (--eval throughput forces batch size 1 for accurate timing)
+BATCH_SIZE: 1   # unused: inference always runs at batch size 1
 
 # Default weights per mode. Override either with --weights on the CLI.
 WEIGHTS_E2E: 'SwinV2LSTM_e2e_raw_mc_V3_sd5_bestMAP.pt'
