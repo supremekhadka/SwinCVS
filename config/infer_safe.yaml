@@ -10,7 +10,7 @@
 # backbone architecture) is fixed by how the released weights were trained.
 # ---------------------------------------------------------------------------
 
-CSV_PATH: ../data/SAFE/labels/metadata_1fps.csv      # path to the SAFE-format annotations csv
+CSV_PATH: ../data/SAFE/labels/1fps/metadata.csv      # path to the SAFE-format annotations csv
 VIDEO_ROOT: ../data/SAFE/images/1fps    # root folder containing one sub-folder per `vid`, each holding frame_.jpg images named "<frame>.jpg" (e.g. VIDEO_ROOT/<vid>/0005.jpg)
 
 SEED: 42
