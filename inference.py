@@ -19,8 +19,8 @@ predictions unless --throughput_only, writing under --output_dir:
 - result.csv (endoscapes: also metrics.json with mAP / balanced accuracy);
   not written with --throughput_only.
 - throughput/framesync.csv (--sync_mode frame): CUDA is synchronized after
-  every frame. One row per video with totals, per-frame means and per-frame
-  min/max/std (ddof=1) of inference and latency times.
+  every frame. One row per frame: vid_id, vid, frame, inference_time_ms,
+  latency_time_ms.
 - throughput/videosync.csv (--sync_mode video): CUDA is synchronized only
   before and after each video. One row per video with totals and
   total / num_frames.
@@ -42,7 +42,6 @@ print("Importing libraries...")
 # Standard library imports
 import argparse
 import json
-import statistics
 import time
 from pathlib import Path
 import warnings
@@ -174,30 +173,36 @@ def elapsed_ms(start, end, is_cuda):
     return start.elapsed_time(end) if is_cuda else (end - start) * 1000.0
 
 
-def throughput_row(vid_id, vid, inference_times_ms, latency_time_ms):
-    """One throughput row. `latency_time_ms` is a per-frame list in frame sync
-    mode (adds min/max/std columns) or the whole-video total in video sync mode."""
-    num_frames = len(inference_times_ms)
-    latency_times_ms = latency_time_ms if isinstance(latency_time_ms, list) else None
-    inference_total = sum(inference_times_ms)
-    latency_total = sum(latency_times_ms) if latency_times_ms is not None else latency_time_ms
-    row = {
-        "vid_id": vid_id,
-        "vid": vid,
-        "num_frames": num_frames,
-        "inference_time_ms": round(inference_total, 3),
-        "latency_time_ms": round(latency_total, 3),
-        "frame_inference_time_ms": round(inference_total / num_frames, 3),
-        "frame_latency_time_ms": round(latency_total / num_frames, 3),
-    }
-    if latency_times_ms is not None:
-        for name, times in (("inference", inference_times_ms), ("latency", latency_times_ms)):
-            row[f"frame_{name}_time_ms_min"] = round(min(times), 3)
-            row[f"frame_{name}_time_ms_max"] = round(max(times), 3)
-            row[f"frame_{name}_time_ms_std"] = round(
-                statistics.stdev(times) if num_frames > 1 else 0.0, 3
+def throughput_records(vid_id, vid, frames, inference_times_ms, latency_time_ms):
+    """Throughput rows for one video. Frame sync passes per-frame latencies (a
+    list) and gets one row per frame; video sync passes the whole-video latency
+    and gets one row with the totals and total / num_frames."""
+    if isinstance(latency_time_ms, list):
+        return [
+            {
+                "vid_id": vid_id,
+                "vid": vid,
+                "frame": frame,
+                "inference_time_ms": round(inference_time_ms, 3),
+                "latency_time_ms": round(frame_latency_time_ms, 3),
+            }
+            for frame, inference_time_ms, frame_latency_time_ms in zip(
+                frames, inference_times_ms, latency_time_ms
             )
-    return row
+        ]
+    num_frames = len(inference_times_ms)
+    inference_total = sum(inference_times_ms)
+    return [
+        {
+            "vid_id": vid_id,
+            "vid": vid,
+            "num_frames": num_frames,
+            "inference_time_ms": round(inference_total, 3),
+            "latency_time_ms": round(latency_time_ms, 3),
+            "frame_inference_time_ms": round(inference_total / num_frames, 3),
+            "frame_latency_time_ms": round(latency_time_ms / num_frames, 3),
+        }
+    ]
 
 
 def run_video_pass(model, dataset, device, meta_df, has_targets, sync_mode):
@@ -255,7 +260,11 @@ def run_video_pass(model, dataset, device, meta_df, has_targets, sync_mode):
                 latency_time_ms = (time.perf_counter() - t_video_start) * 1000.0
                 inference_times_ms = [elapsed_ms(start, end, is_cuda) for start, end in timings]
 
-        rows.append(throughput_row(vid_id, vid, inference_times_ms, latency_time_ms))
+        rows.extend(
+            throughput_records(
+                vid_id, vid, group["frame"].tolist(), inference_times_ms, latency_time_ms
+            )
+        )
 
     probs = torch.cat(probs, dim=0)
     if has_targets:
@@ -294,9 +303,10 @@ def write_outputs(output_dir, throughput_df, resource_monitor, sync_mode):
     throughput_path = throughput_dir / f"{sync_mode}sync.csv"
     throughput_df.to_csv(throughput_path, index=False)
     print(f"Throughput ({sync_mode} sync) saved to: {throughput_path}")
+    prefix = "frame_" if sync_mode == "video" else ""  # framesync rows are already per frame
     print(
-        f"Mean per-frame inference time: {throughput_df['frame_inference_time_ms'].mean():.2f} ms | "
-        f"Mean per-frame latency: {throughput_df['frame_latency_time_ms'].mean():.2f} ms"
+        f"Mean per-frame inference time: {throughput_df[prefix + 'inference_time_ms'].mean():.2f} ms | "
+        f"Mean per-frame latency: {throughput_df[prefix + 'latency_time_ms'].mean():.2f} ms"
     )
 
     resources_dir = output_dir / "resources" / f"{sync_mode}sync"

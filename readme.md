@@ -170,7 +170,7 @@ Written to `--output_dir`:
   - Endoscapes: one row per 5-frame-window label (as in the original pipeline).
   - SAFE: one row per `is_ds_keyframe == True` row that had a full, contiguous 5-frame window available (see format below); keyframes without one are dropped and reported in the run log.
 - **`metrics.json`** (Endoscapes only): `avg_bal_acc`, `C1_bacc`/`C2_bacc`/`C3_bacc`, `avg_map`, `C1_map`/`C2_map`/`C3_map`, computed against ground truth.
-- **`throughput/<mode>sync.csv`**: one row per `vid`; see [Throughput modes](#throughput-modes) for the columns.
+- **`throughput/<mode>sync.csv`**: one row per frame (`framesync.csv`) or per `vid` (`videosync.csv`); see [Throughput modes](#throughput-modes) for the columns.
 - **`resources/<mode>sync/peak.csv`**: one row, `peak_memory_mb`, `peak_power_w`.
 - **`resources/<mode>sync/resource.csv`**: the sampled time series `time_s`, `memory_mb`, `power_w`, covering warm-up and the full run.
 
@@ -191,9 +191,9 @@ Both modes time each frame the same way:
 - `inference_time_ms`: CUDA-event elapsed time around the model forward only (no pre/postprocessing), under `torch.inference_mode()`.
 - `latency_time_ms`: `perf_counter` from the start of preprocessing (image load + transform + device transfer) to the end of postprocessing (sigmoid, copy to CPU) after a final CUDA sync.
 
-`--sync_mode frame` synchronizes after every frame and reads that frame's event time right after. `throughput/framesync.csv` columns: `vid_id`, `vid`, `num_frames`, `inference_time_ms`, `latency_time_ms` (video totals), `frame_inference_time_ms`, `frame_latency_time_ms` (per-frame means), and `frame_inference_time_ms_{min,max,std}`, `frame_latency_time_ms_{min,max,std}` (sample std, ddof=1; 0.0 for a one-frame video).
+`--sync_mode frame` synchronizes after every frame and reads that frame's event time right after. `throughput/framesync.csv` has one row per frame: `vid_id`, `vid`, `frame`, `inference_time_ms`, `latency_time_ms`.
 
-`--sync_mode video` records an event pair per frame without per-frame syncs (postprocessing runs after the last frame), and syncs only once before and once after each video. The inference total is the sum of the event times; the latency total is the whole-video `perf_counter` time. `throughput/videosync.csv` columns: `vid_id`, `vid`, `num_frames`, `inference_time_ms`, `latency_time_ms` (video totals), `frame_inference_time_ms`, `frame_latency_time_ms` (total / `num_frames`). There are no min/max/std columns.
+`--sync_mode video` records an event pair per frame without per-frame syncs (postprocessing runs after the last frame), and syncs only once before and once after each video. The inference total is the sum of the event times; the latency total is the whole-video `perf_counter` time. `throughput/videosync.csv` columns: `vid_id`, `vid`, `num_frames`, `inference_time_ms`, `latency_time_ms` (video totals), `frame_inference_time_ms`, `frame_latency_time_ms` (total / `num_frames`).
 
 ### Data formats
 
