@@ -191,7 +191,7 @@ Both modes time each frame the same way:
 - `inference_time_ms`: CUDA-event elapsed time around the model forward only (no pre/postprocessing), under `torch.inference_mode()`.
 - `latency_time_ms`: `perf_counter` from the start of preprocessing (image load + transform + device transfer) to the end of postprocessing (sigmoid, copy to CPU) after a final CUDA sync.
 
-`--sync_mode frame` synchronizes after every frame and reads that frame's event time right after. `throughput/framesync.csv` has one row per frame: `vid_id`, `vid`, `frame`, `inference_time_ms`, `latency_time_ms`.
+`--sync_mode frame` synchronizes after every frame and reads that frame's event time right after. `throughput/framesync.csv` has one row per frame: `vid_id`, `vid`, `frame`, `inference_time_ms`, `latency_time_ms`. A row is one forward pass, i.e. one prediction, so it has the same rows as `result.csv`: each prediction takes a 5-frame window, so `frame` is the keyframe's number and both times cover the whole window. On SAFE only `is_ds_keyframe == True` rows with a full contiguous window get a row (the other 1fps rows are only window context); on Endoscapes there is one row per 5-frame labelled window. Warm-up passes are not logged; those samples are measured again in the full pass.
 
 `--sync_mode video` records an event pair per frame without per-frame syncs (postprocessing runs after the last frame), and syncs only once before and once after each video. The inference total is the sum of the event times; the latency total is the whole-video `perf_counter` time. `throughput/videosync.csv` columns: `vid_id`, `vid`, `num_frames`, `inference_time_ms`, `latency_time_ms` (video totals), `frame_inference_time_ms`, `frame_latency_time_ms` (total / `num_frames`).
 
