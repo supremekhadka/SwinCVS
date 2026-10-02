@@ -21,7 +21,8 @@ REPO_ROOT = Path(__file__).resolve().parent
 # Jetson (L4T) ships /etc/nv_tegra_release; anything else is the Nitro 5 / GTX 1650 Ti.
 DEFAULT_MACHINE_TAG = "jetson_orin_nano" if Path("/etc/nv_tegra_release").exists() else "nitro5_1650ti"
 MACHINE_TAG = os.environ.get("MACHINE_TAG", DEFAULT_MACHINE_TAG)
-OUT_BASE = REPO_ROOT / "outputs" / "pretrained" / MACHINE_TAG / "safe" / "all"
+SPLIT = "all"
+OUT_BASE = REPO_ROOT / "outputs" / "pretrained" / MACHINE_TAG / "safe" 
 
 CONFIG = "config/infer_safe.yaml"  # SAFE 1fps csv/frames: SwinCVS needs the is_ds_keyframe
                                    # flag and 4 contiguous preceding frames per keyframe, which
@@ -35,7 +36,7 @@ RUNS = [
 
 
 def run(slug):
-    out_dir = OUT_BASE / slug
+    out_dir = OUT_BASE / slug / SPLIT
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"==> [{slug}] inference + throughput + resource usage (1fps, warmup={WARMUP})")
