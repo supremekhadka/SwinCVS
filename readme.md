@@ -93,7 +93,7 @@ python3 inference.py \
   --output_dir <output directory>
 ```
 
-A single pass (batch size 1, over every video) reports predictions, per-video throughput and resource usage together, so there are no separate inference/throughput modes.
+Each run makes a single pass (batch size 1, over every video) and measures per-video throughput and resource usage in one of two sync modes (`--sync_mode frame` or `--sync_mode video`, see [Throughput modes](#throughput-modes)). It also writes predictions (`result.csv`, plus `metrics.json` for Endoscapes) unless `--throughput_only` is given. Inference is normally measured together with video sync, while frame sync is run throughput-only.
 
 | Flag | Required | Meaning |
 |---|---|---|
@@ -106,12 +106,25 @@ A single pass (batch size 1, over every video) reports predictions, per-video th
 | `--csv_path` | no | Override `CSV_PATH` from the config. |
 | `--images_path` | no | Endoscapes only — override `IMAGES_PATH` from the config. |
 | `--video_root` | no | SAFE only — override `VIDEO_ROOT` from the config. |
+| `--sync_mode` | no (default `video`) | Throughput sync mode: `frame` (sync after every frame, writes `throughput/framesync.csv`) or `video` (sync only at video boundaries, writes `throughput/videosync.csv`). |
+| `--throughput_only` | no | Only measure throughput and resource usage; do not write `result.csv` / `metrics.json`. |
 
 Inference always runs at batch size 1 so per-frame timing is exact; batching would only give an averaged number.
 
 For SAFE, `VIDEO_ROOT`/`CSV_PATH` (`config/infer_safe.yaml`) are the 1fps-sampled frames and CSV. This differs from the `cvs`/`CVS-AdaptNet` repos, which use the 5fps frames: here, every prediction needs the 4 frames immediately preceding the keyframe to build its input sequence, and only `metadata_1fps.csv` marks keyframes (`is_ds_keyframe`), so 5fps sampling wouldn't give a valid contiguous window.
 
-To run both modes on SAFE in one go, use `run_safe_inference_all.py`. It writes to `outputs/pretrained/<device>/safe/all/<mode>/` (`<device>` is auto-detected as `jetson_orin_nano` or `nitro5_1650ti`; override with `MACHINE_TAG`).
+To run both modes on SAFE in one go, use `run_safe_inference_all.py`. It writes to `outputs/pretrained/<device>/safe/all/<mode>/` (`<device>` is auto-detected as `jetson_orin_nano` or `nitro5_1650ti`; override with `MACHINE_TAG`). Select what to run with `--throughput` and `--inference`:
+
+```bash
+./run_safe_inference_all.py                                # inference + frame and video sync (default)
+./run_safe_inference_all.py --throughput                   # frame and video sync, no result.csv
+./run_safe_inference_all.py --throughput frame             # frame sync only
+./run_safe_inference_all.py --throughput video             # video sync only
+./run_safe_inference_all.py --inference --throughput video # inference + video sync in one pass
+./run_safe_inference_all.py --inference                    # inference (measured with video sync)
+```
+
+Inference always shares a pass with a throughput mode: video sync, or frame sync if `--throughput frame` is the only mode selected. Every other selected mode gets its own throughput-only pass.
 
 ### Examples
 
@@ -120,9 +133,13 @@ To run both modes on SAFE in one go, use `run_safe_inference_all.py`. It writes 
 python3 inference.py --dataset endoscapes --config_path config/infer.yaml \
   --mode frozen --output_dir results/endoscapes_01
 
-# SAFE, end-to-end backbone
+# SAFE, end-to-end backbone, inference + video sync throughput
 python3 inference.py --dataset safe --config_path config/infer_safe.yaml \
-  --mode e2e --output_dir results/safe_01
+  --mode e2e --output_dir results/safe_01 --sync_mode video
+
+# SAFE, end-to-end backbone, frame sync throughput only (no result.csv)
+python3 inference.py --dataset safe --config_path config/infer_safe.yaml \
+  --mode e2e --output_dir results/safe_01 --sync_mode frame --throughput_only
 
 # SAFE, weights overridden at the CLI
 python3 inference.py --dataset safe --config_path config/infer_safe.yaml \
@@ -137,13 +154,25 @@ python3 inference.py --dataset safe --config_path config/infer_safe.yaml \
 
 Written to `--output_dir`:
 
+```text
+<output_dir>/
+├── result.csv                  # not written with --throughput_only
+├── metrics.json                # Endoscapes only, not written with --throughput_only
+├── throughput/
+│   ├── framesync.csv           # --sync_mode frame
+│   └── videosync.csv           # --sync_mode video
+└── resources/
+    ├── framesync/{peak,resource}.csv
+    └── videosync/{peak,resource}.csv
+```
+
 - **`result.csv`**: every input column preserved for each row evaluated, plus `Conf_C1`, `Conf_C2`, `Conf_C3` — the model's sigmoid confidences for each CVS criterion.
   - Endoscapes: one row per 5-frame-window label (as in the original pipeline).
   - SAFE: one row per `is_ds_keyframe == True` row that had a full, contiguous 5-frame window available (see format below); keyframes without one are dropped and reported in the run log.
 - **`metrics.json`** (Endoscapes only): `avg_bal_acc`, `C1_bacc`/`C2_bacc`/`C3_bacc`, `avg_map`, `C1_map`/`C2_map`/`C3_map`, computed against ground truth.
-- **`throughput.csv`**: one row per `vid` with `vid_id`, `vid`, `num_frames`, `inference_time_ms`, `latency_time_ms`, `frame_inference_time_ms`, `frame_latency_time_ms` (the video totals divided by `num_frames`) and `frame_inference_time_ms_min`/`_max`/`_std`. `inference_time_ms` is the sum of per-frame forward times measured with CUDA events; CUDA is synchronized only once per video (video boundary). `latency_time_ms` covers the whole video end-to-end (image load + transform + device transfer + forward + sigmoid).
-- **`resources/peak.csv`**: one row, `peak_memory_mb`, `peak_power_w`.
-- **`resources/resource.csv`**: the sampled time series `time_s`, `memory_mb`, `power_w`, covering warm-up and the full run.
+- **`throughput/<mode>sync.csv`**: one row per `vid`; see [Throughput modes](#throughput-modes) for the columns.
+- **`resources/<mode>sync/peak.csv`**: one row, `peak_memory_mb`, `peak_power_w`.
+- **`resources/<mode>sync/resource.csv`**: the sampled time series `time_s`, `memory_mb`, `power_w`, covering warm-up and the full run.
 
 Resource usage is sampled in the background over the whole run (including
 warm-up), GPU-only. Memory comes from CUDA's allocator counters
@@ -154,6 +183,17 @@ rail, the closest proxy available on Orin Nano (GPU + CPU + deep learning
 accelerator cores, not pure GPU power); on a desktop GPU (`nvidia-smi`
 present) it is `power.draw`, which is GPU-only. If neither binary is on
 `PATH`, power samples stay empty.
+
+### Throughput modes
+
+Both modes time each frame the same way:
+
+- `inference_time_ms`: CUDA-event elapsed time around the model forward only (no pre/postprocessing), under `torch.inference_mode()`.
+- `latency_time_ms`: `perf_counter` from the start of preprocessing (image load + transform + device transfer) to the end of postprocessing (sigmoid, copy to CPU) after a final CUDA sync.
+
+`--sync_mode frame` synchronizes after every frame and reads that frame's event time right after. `throughput/framesync.csv` columns: `vid_id`, `vid`, `num_frames`, `inference_time_ms`, `latency_time_ms` (video totals), `frame_inference_time_ms`, `frame_latency_time_ms` (per-frame means), and `frame_inference_time_ms_{min,max,std}`, `frame_latency_time_ms_{min,max,std}` (sample std, ddof=1; 0.0 for a one-frame video).
+
+`--sync_mode video` records an event pair per frame without per-frame syncs (postprocessing runs after the last frame), and syncs only once before and once after each video. The inference total is the sum of the event times; the latency total is the whole-video `perf_counter` time. `throughput/videosync.csv` columns: `vid_id`, `vid`, `num_frames`, `inference_time_ms`, `latency_time_ms` (video totals), `frame_inference_time_ms`, `frame_latency_time_ms` (total / `num_frames`). There are no min/max/std columns.
 
 ### Data formats
 

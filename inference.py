@@ -12,14 +12,25 @@ dataset can be reused across runs:
     python3 inference.py --dataset safe --config_path config/infer_safe.yaml \
         --mode frozen --output_dir results/safe_01
 
-A single pass (batch size 1, over every video) reports predictions,
-per-video throughput and resource usage together, writing under --output_dir:
+A single pass (batch size 1, over every video) reports per-video throughput
+and resource usage in one sync mode (--sync_mode frame or video), plus
+predictions unless --throughput_only, writing under --output_dir:
 
-- result.csv (endoscapes: also metrics.json with mAP / balanced accuracy)
-- throughput.csv: one row per video; frames are timed with CUDA events and
-  CUDA is synchronized only at video boundaries (once per video).
-- resources/peak.csv, resources/resource.csv: GPU-only peak and sampled
-  memory/power over the whole run, see scripts/resource_monitor.py.
+- result.csv (endoscapes: also metrics.json with mAP / balanced accuracy);
+  not written with --throughput_only.
+- throughput/framesync.csv (--sync_mode frame): CUDA is synchronized after
+  every frame. One row per video with totals, per-frame means and per-frame
+  min/max/std (ddof=1) of inference and latency times.
+- throughput/videosync.csv (--sync_mode video): CUDA is synchronized only
+  before and after each video. One row per video with totals and
+  total / num_frames.
+- resources/<mode>sync/peak.csv, resources/<mode>sync/resource.csv: GPU-only
+  peak and sampled memory/power over the whole run, see
+  scripts/resource_monitor.py.
+
+inference_time_ms is the model forward only (CUDA events, under
+torch.inference_mode()); latency_time_ms runs from dataset loading/transform
+to the end of postprocessing (sigmoid, copy to CPU) after a final sync.
 
 Both modes read from the same VIDEO_ROOT/CSV_PATH: for SAFE this is the
 1fps-sampled frames, since each prediction needs the 4 frames preceding the
@@ -56,6 +67,8 @@ from scripts.f_dataset_safe import get_safe_inference_dataset
 
 warnings.filterwarnings("ignore")
 
+SYNC_MODES = ("frame", "video")
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Run SwinCVS inference")
@@ -90,6 +103,15 @@ def parse_args():
     parser.add_argument("--csv_path", type=str, default=None, help="Override config.CSV_PATH")
     parser.add_argument("--images_path", type=str, default=None, help="Endoscapes only: override config.IMAGES_PATH")
     parser.add_argument("--video_root", type=str, default=None, help="Safe only: override config.VIDEO_ROOT")
+    parser.add_argument(
+        "--sync_mode", "--sync-mode", choices=SYNC_MODES, default="video",
+        help="Throughput sync mode: frame (synchronize after every frame, writes throughput/framesync.csv) "
+             "or video (synchronize at video boundaries only, writes throughput/videosync.csv).",
+    )
+    parser.add_argument(
+        "--throughput_only", "--throughput-only", action="store_true",
+        help="Only measure throughput and resource usage; do not write result.csv (or metrics.json).",
+    )
     return parser.parse_args()
 
 
@@ -133,79 +155,107 @@ def load_config(args):
     return config
 
 
-def run_video_pass(model, dataset, device, meta_df, has_targets):
+def timed_forward(model, sample, is_cuda):
+    """Model forward only, bracketed by CUDA events (perf_counter on CPU), no synchronize."""
+    if is_cuda:
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        out = model(sample)
+        end.record()
+        return out, start, end
+    start = time.perf_counter()
+    out = model(sample)
+    return out, start, time.perf_counter()
+
+
+def elapsed_ms(start, end, is_cuda):
+    """Read a timed_forward pair; for CUDA events the end event must have completed."""
+    return start.elapsed_time(end) if is_cuda else (end - start) * 1000.0
+
+
+def throughput_row(vid_id, vid, inference_times_ms, latency_time_ms):
+    """One throughput row. `latency_time_ms` is a per-frame list in frame sync
+    mode (adds min/max/std columns) or the whole-video total in video sync mode."""
+    num_frames = len(inference_times_ms)
+    latency_times_ms = latency_time_ms if isinstance(latency_time_ms, list) else None
+    inference_total = sum(inference_times_ms)
+    latency_total = sum(latency_times_ms) if latency_times_ms is not None else latency_time_ms
+    row = {
+        "vid_id": vid_id,
+        "vid": vid,
+        "num_frames": num_frames,
+        "inference_time_ms": round(inference_total, 3),
+        "latency_time_ms": round(latency_total, 3),
+        "frame_inference_time_ms": round(inference_total / num_frames, 3),
+        "frame_latency_time_ms": round(latency_total / num_frames, 3),
+    }
+    if latency_times_ms is not None:
+        for name, times in (("inference", inference_times_ms), ("latency", latency_times_ms)):
+            row[f"frame_{name}_time_ms_min"] = round(min(times), 3)
+            row[f"frame_{name}_time_ms_max"] = round(max(times), 3)
+            row[f"frame_{name}_time_ms_std"] = round(
+                statistics.stdev(times) if num_frames > 1 else 0.0, 3
+            )
+    return row
+
+
+def run_video_pass(model, dataset, device, meta_df, has_targets, sync_mode):
     """
-    Single pass over every video (batch size 1): each frame's forward pass is
-    timed with CUDA events (no per-frame synchronize) and CUDA is synchronized
-    only once per video. Returns (probs, targets, throughput_df) with probs/
-    targets in dataset order and one throughput row per `vid`.
+    Single pass over every video (batch size 1), timing each frame's forward
+    pass with CUDA events. sync_mode "frame" synchronizes after every frame;
+    "video" synchronizes only before and after each video, postprocessing
+    (sigmoid + copy to CPU) once the whole video has been run. Returns (probs,
+    targets, throughput_df) with probs/targets in dataset order and one
+    throughput row per `vid`.
     """
     is_cuda = device.startswith("cuda")
+
+    def synchronize():
+        if is_cuda:
+            torch.cuda.synchronize()
+
+    def preprocess(idx):
+        item = dataset[idx]  # preprocessing happens here, on the main thread
+        if has_targets:
+            sample, target = item
+            targets[idx] = target
+        else:
+            sample = item
+        return sample.unsqueeze(0).to(device, non_blocking=True)
+
     probs = [None] * len(meta_df)
     targets = [None] * len(meta_df) if has_targets else None
     rows = []
-    for vid, group in tqdm(meta_df.groupby("vid", sort=False), desc="Processing videos"):
+    for vid, group in tqdm(meta_df.groupby("vid", sort=False), desc=f"Processing videos ({sync_mode} sync)"):
         indices = group.index.tolist()
         vid_id = group["vid_id"].iloc[0] if "vid_id" in group.columns else None
 
-        start_events, end_events, outputs = [], [], []
-        if is_cuda:
-            torch.cuda.synchronize()
-        t_video_start = time.perf_counter()
         with torch.inference_mode():
-            for idx in indices:
-                item = dataset[idx]  # preprocessing happens here, on the main thread
-                if has_targets:
-                    sample, target = item
-                    targets[idx] = target
-                else:
-                    sample = item
-                sample = sample.unsqueeze(0).to(device, non_blocking=True)
-
-                if is_cuda:
-                    start_evt = torch.cuda.Event(enable_timing=True)
-                    end_evt = torch.cuda.Event(enable_timing=True)
-                    start_evt.record()
-                    out = model(sample)
-                    end_evt.record()
-                    start_events.append(start_evt)
-                    end_events.append(end_evt)
-                else:
-                    t0 = time.perf_counter()
-                    out = model(sample)
-                    start_events.append(t0)
-                    end_events.append(time.perf_counter())
-                outputs.append(out)
-
-            if is_cuda:
-                torch.cuda.synchronize()
-                frame_times_ms = [s.elapsed_time(e) for s, e in zip(start_events, end_events)]
+            if sync_mode == "frame":
+                inference_times_ms, latency_time_ms = [], []
+                for idx in indices:
+                    t_frame_start = time.perf_counter()
+                    out, start, end = timed_forward(model, preprocess(idx), is_cuda)
+                    probs[idx] = torch.sigmoid(out).to("cpu")
+                    synchronize()
+                    latency_time_ms.append((time.perf_counter() - t_frame_start) * 1000.0)
+                    inference_times_ms.append(elapsed_ms(start, end, is_cuda))
             else:
-                frame_times_ms = [(e - s) * 1000.0 for s, e in zip(start_events, end_events)]
+                timings, outputs = [], []
+                synchronize()
+                t_video_start = time.perf_counter()
+                for idx in indices:
+                    out, start, end = timed_forward(model, preprocess(idx), is_cuda)
+                    timings.append((start, end))
+                    outputs.append(out)
+                for idx, out in zip(indices, outputs):
+                    probs[idx] = torch.sigmoid(out).to("cpu")
+                synchronize()
+                latency_time_ms = (time.perf_counter() - t_video_start) * 1000.0
+                inference_times_ms = [elapsed_ms(start, end, is_cuda) for start, end in timings]
 
-            for idx, out in zip(indices, outputs):
-                probs[idx] = torch.sigmoid(out).to("cpu")
-        t_video_end = time.perf_counter()
-
-        num_frames = len(indices)
-        total_inference_time_ms = sum(frame_times_ms)
-        total_latency_time_ms = (t_video_end - t_video_start) * 1000.0
-        rows.append(
-            {
-                "vid_id": vid_id,
-                "vid": vid,
-                "num_frames": num_frames,
-                "inference_time_ms": round(total_inference_time_ms, 3),
-                "latency_time_ms": round(total_latency_time_ms, 3),
-                "frame_inference_time_ms": round(total_inference_time_ms / num_frames, 3),
-                "frame_latency_time_ms": round(total_latency_time_ms / num_frames, 3),
-                "frame_inference_time_ms_min": round(min(frame_times_ms), 3),
-                "frame_inference_time_ms_max": round(max(frame_times_ms), 3),
-                "frame_inference_time_ms_std": round(
-                    statistics.pstdev(frame_times_ms) if num_frames > 1 else 0.0, 3
-                ),
-            }
-        )
+        rows.append(throughput_row(vid_id, vid, inference_times_ms, latency_time_ms))
 
     probs = torch.cat(probs, dim=0)
     if has_targets:
@@ -238,16 +288,18 @@ def warmup_model(model, dataset, device, n_warmup):
     print("Warmup complete.")
 
 
-def write_outputs(output_dir, throughput_df, resource_monitor):
-    throughput_path = output_dir / "throughput.csv"
+def write_outputs(output_dir, throughput_df, resource_monitor, sync_mode):
+    throughput_dir = output_dir / "throughput"
+    throughput_dir.mkdir(parents=True, exist_ok=True)
+    throughput_path = throughput_dir / f"{sync_mode}sync.csv"
     throughput_df.to_csv(throughput_path, index=False)
-    print(f"Throughput saved to: {throughput_path}")
+    print(f"Throughput ({sync_mode} sync) saved to: {throughput_path}")
     print(
         f"Mean per-frame inference time: {throughput_df['frame_inference_time_ms'].mean():.2f} ms | "
         f"Mean per-frame latency: {throughput_df['frame_latency_time_ms'].mean():.2f} ms"
     )
 
-    resources_dir = output_dir / "resources"
+    resources_dir = output_dir / "resources" / f"{sync_mode}sync"
     resources_dir.mkdir(parents=True, exist_ok=True)
     peak_path = resources_dir / "peak.csv"
     pd.DataFrame([{
@@ -275,9 +327,12 @@ def run_endoscapes(config, args, model, device, output_dir):
     resource_monitor.start()
     warmup_model(model, dataset, device, args.warmup)
     probs, targets, throughput_df = run_video_pass(
-        model, dataset, device, meta_df, has_targets=True
+        model, dataset, device, meta_df, has_targets=True, sync_mode=args.sync_mode
     )
     resource_monitor.stop()
+    write_outputs(output_dir, throughput_df, resource_monitor, args.sync_mode)
+    if args.throughput_only:
+        return
 
     preds = torch.round(probs)
 
@@ -306,7 +361,6 @@ def run_endoscapes(config, args, model, device, output_dir):
     result_df.to_csv(result_path, index=False)
     print(f"Predictions saved to: {result_path}")
     print(f"Metrics saved to: {output_dir / 'metrics.json'}")
-    write_outputs(output_dir, throughput_df, resource_monitor)
 
 
 def run_safe(config, args, model, device, output_dir):
@@ -318,10 +372,13 @@ def run_safe(config, args, model, device, output_dir):
     resource_monitor.start()
     warmup_model(model, dataset, device, args.warmup)
     probs, _, throughput_df = run_video_pass(
-        model, dataset, device, meta_df, has_targets=False
+        model, dataset, device, meta_df, has_targets=False, sync_mode=args.sync_mode
     )
     resource_monitor.stop()
     assert probs.shape[0] == len(meta_df), "Prediction / metadata row count mismatch"
+    write_outputs(output_dir, throughput_df, resource_monitor, args.sync_mode)
+    if args.throughput_only:
+        return
 
     result_df = meta_df.copy()
     result_df["Conf_C1"] = probs[:, 0].tolist()
@@ -330,7 +387,6 @@ def run_safe(config, args, model, device, output_dir):
     result_path = output_dir / "result.csv"
     result_df.to_csv(result_path, index=False)
     print(f"Predictions saved to: {result_path}")
-    write_outputs(output_dir, throughput_df, resource_monitor)
 
 
 def main():
@@ -357,7 +413,8 @@ def main():
     if device.startswith("cuda"):
         torch.cuda.empty_cache()
 
-    print("\nRunning inference + throughput + resource usage")
+    task = "throughput" if args.throughput_only else "inference + throughput"
+    print(f"\nRunning {task} + resource usage ({args.sync_mode} sync)")
     if args.dataset == "endoscapes":
         run_endoscapes(config, args, model, device, output_dir)
     else:
