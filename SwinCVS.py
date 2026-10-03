@@ -199,7 +199,7 @@ if not config.MODEL.INFERENCE:
         print(
             "\nAverage balanced accuracy",
             round(
-                (C1_balanced_accuracy + C1_balanced_accuracy + C3_balanced_accuracy)
+                (C1_balanced_accuracy + C2_balanced_accuracy + C3_balanced_accuracy)
                 / 3,
                 4,
             ),
@@ -321,7 +321,7 @@ C1_ap, C2_ap, C3_ap, mAP = get_map(test_targets, test_probabilities)
 print("\nTesting results:")
 print(
     "Average balanced accuracy",
-    round((C1_balanced_accuracy + C1_balanced_accuracy + C3_balanced_accuracy) / 3, 4),
+    round((C1_balanced_accuracy + C2_balanced_accuracy + C3_balanced_accuracy) / 3, 4),
 )
 print("C1 bacc", round(C1_balanced_accuracy, 4))
 print("C2 bacc", round(C2_balanced_accuracy, 4))

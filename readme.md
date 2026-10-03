@@ -3,7 +3,7 @@
 **Authors**:
 Franciszek Nowak, Evangelos B. Mazomenos, Brian Davidson, Matthew J. Clarkson
 
-This repository is a fork of [franeknowak/SwinCVS](https://github.com/franeknowak/SwinCVS). The model and training pipeline are unchanged from the original publication (trained on the **Endoscapes2023** dataset). The changes in this fork are limited to inference: the original repo could only run inference on Endoscapes-format annotations, and it has been extended here to also run on our **SAFE** dataset, without touching the Endoscapes pipeline or the training code.
+This repository is a fork of [franeknowak/SwinCVS](https://github.com/franeknowak/SwinCVS). The model and training pipeline are unchanged from the original publication (trained on the **Endoscapes2023** dataset). The original repo could only run inference on Endoscapes-format annotations. This fork extends it to run inference on our **SAFE** dataset and adds a separate script for fine-tuning on SAFE (`train_safe.py`, see [Fine-tuning on SAFE](#fine-tuning-on-safe)). The Endoscapes pipeline and training script are unchanged apart from small metric fixes.
 
 ---
 
@@ -56,7 +56,7 @@ The desktop install above (conda + a fixed pytorch-cuda build) doesn't apply on 
 
 ## Training
 
-Training is unchanged from the original repository and only ever runs on Endoscapes2023.
+`SwinCVS.py` training is unchanged from the original repository and only runs on Endoscapes2023. To fine-tune on SAFE, see [Fine-tuning on SAFE](#fine-tuning-on-safe).
 
 Script is run by executing `SwinCVS.py` from the root of the repository. Model and training parameters are set within `config/SwinCVS_config.yaml`. Settings that specify model selection are:
 - `MODEL.LSTM`: `False` - just SwinV2 backbone training, `True` - SwinCVS = SwinV2 with LSTM
@@ -212,6 +212,71 @@ For every row with `is_ds_keyframe == True`, the 4 immediately preceding rows in
 
 ---
 
+## Fine-tuning on SAFE
+
+`train_safe.py` fine-tunes either released SwinCVS variant on SAFE. It is separate from `SwinCVS.py`, which still trains on Endoscapes only. Each variant has its own config:
+
+| Variant | Config | Initialised from (`MODEL.INIT_WEIGHTS`) | Trained parameters |
+|---|---|---|---|
+| End-to-end | `config/SwinCVS_safe_finetune_e2e.yaml` | `SwinV2LSTM_e2e_raw_mc_V3_sd5_bestMAP.pt` | backbone, `fc_swin`, LSTM, `fc_lstm` |
+| Frozen | `config/SwinCVS_safe_finetune_frozen.yaml` | `SwinCVS_frozen_ENDP_sd5_bestMAP.pt` | LSTM, `fc_lstm` (backbone frozen) |
+
+```bash
+python3 train_safe.py --config config/SwinCVS_safe_finetune_e2e.yaml
+python3 train_safe.py --config config/SwinCVS_safe_finetune_frozen.yaml
+
+# common overrides
+python3 train_safe.py --config config/SwinCVS_safe_finetune_frozen.yaml \
+  --data_root /path/to/SAFE --device cuda:0 --epochs 20 --batch_size 8 --num_workers 8 \
+  --eval_test --opts TRAIN.OPTIMIZER.CLASSIFIER_LR 5e-5 DATA.AUGMENT.ENABLE False
+```
+
+**Initialisation.** The full SwinCVS checkpoint is loaded with a strict `load_state_dict`. A missing file, a missing or unexpected key, or a shape mismatch stops the run. `INIT_WEIGHTS` can be a path or a file name under `weights/`. `BACKBONE.PRETRAINED` (the Endoscapes path, which ignores load errors) is not used here.
+
+**Data.** `DATA.ROOT` defaults to `../data/SAFE`. The script reads `labels/1fps/splits/{train,val,test}.csv` and the images at `images/1fps/<vid>/<vid>_<frame>.jpg`. There is one sample for each `is_ds_keyframe` row: the 5 consecutive frames that end at the keyframe, within the same video (the same window logic as SAFE inference). The targets are `C1`/`C2`/`C3`. This gives 3365 train, 548 val and 592 test samples. If a split csv has no `is_ds_keyframe` or label columns, they are joined from `labels/1fps/metadata.csv`. Preprocessing matches `inference.py --dataset safe` exactly: Resize(384, 683), CenterCrop(384), Normalize, then per-image min-max. The train split also gets light augmentation (`DATA.AUGMENT`: horizontal flip and mild colour jitter). The random parameters are drawn once per 5-frame sequence, so every frame in a sequence gets the same transform. Set `DATA.AUGMENT.ENABLE: False` to turn it off. The per-image min-max scaling mostly cancels brightness and contrast jitter.
+
+**Loss.** `BCEWithLogitsLoss(pos_weight = #neg / #pos)` for each criterion, computed from the SAFE train split (about [5.87, 24.69, 12.41]). You can override it with `TRAIN.POS_WEIGHT`. For E2E the loss is `alpha * L(fc_swin) + (1 - alpha) * L(fc_lstm)`. `TRAIN.MULTICLASSIFIER_ALPHA` defaults to 0.6, which is the value at the end of the original 10-epoch schedule. Set `MULTICLASSIFIER_ALPHA_DECAY: True` to use the original per-epoch decay instead. Validation uses the same criterion and alpha, and losses are averaged per sample.
+
+**Optimisation.** AdamW with the original betas, eps and weight decay. AMP and gradient clipping (`CLIP_GRAD: 5`) match `SwinCVS.py`. The original training used constant learning rates of 1e-5 (encoder) and 1e-3 (LSTM/classifier). Fine-tuning uses lower defaults:
+
+- E2E: `ENCODER_LR` 5e-6 (backbone + `fc_swin`), `CLASSIFIER_LR` 1e-4.
+- Frozen: `CLASSIFIER_LR` 1e-4.
+- Both: a 1-epoch linear warmup, then a per-step cosine decay to 1% (`TRAIN.LR_SCHEDULER`; `NAME: 'none'` keeps the rate constant).
+
+Gradient accumulation (`TRAIN.ACCUMULATION_STEPS`) divides the loss by N and steps and zeroes the gradients only every N iterations.
+
+**Memory (24GB GPU).** E2E defaults to `BACKBONE.USE_CHECKPOINT: True` (gradient checkpointing in the SwinV2 blocks), batch 2 and accumulation 2, which gives an effective batch of 4 (the original batch size). Frozen uses batch 8 without checkpointing, since no gradients flow through the backbone. `MODEL.FROZEN_BACKBONE_EVAL: True` keeps the frozen backbone in eval mode, which disables drop-path. The default `False` matches the original training.
+
+**Logging (wandb).** The project is `safe-cvs-finetune` by default, and the run name is `EXPERIMENT_NAME` (`safe_finetune_e2e` / `safe_finetune_frozen`). Configure it under the `WANDB` block, or with `--wandb_project`, `--wandb_entity` and `--no_wandb`. The `WANDB_MODE` environment variable (`online`/`offline`/`disabled`) is respected.
+
+| Key | When | Contents |
+|---|---|---|
+| `train/loss`, `train/loss_lstm`, `train/loss_swin` (E2E), `train/lr_*`, `train/grad_norm` | every iteration | |
+| `train/epoch_loss`, `train/epoch_loss_lstm`, `train/epoch_loss_swin` (E2E) | every epoch | per-sample means |
+| `val/loss`, `val/loss_lstm`, `val/loss_swin` (E2E) | every epoch | same criterion and mix as train |
+| `val/mAP`, `val/AP_C1..C3`, `val/bacc_C1..C3`, `val/bacc_mean`, `val/recall_mean` | every epoch | from the LSTM head, the one used at inference |
+
+No metrics are computed on the train split. `val/recall_mean` is the value that `scripts/f_metrics.py` returns, and `SwinCVS.py` reports it as `avg_bal_acc`. `val/bacc_mean` is the true mean of the three balanced accuracies.
+
+**Outputs.** Each run gets a new directory, `<OUTPUT_DIR>/<run_name>_<timestamp>/` (default `work_dirs/safe_finetune/`). Nothing in `weights/` is written. The directory contains:
+
+- `config.yaml`
+- `results.json` (per-epoch losses, metrics and val probabilities)
+- `best.pt` (best val mAP) and `last.pt`, both plain state dicts that `inference.py --weights <path>` can load (use `--mode e2e` or `--mode frozen` to match the variant)
+- the wandb files
+
+With `--eval_test` (or `TEST.ENABLE: True`), the best checkpoint is then evaluated on the test split, and `test_metrics.json` and `test_result.csv` are written.
+
+**Debugging / smoke tests.** `--max_train_iters N` and `--max_val_iters N` cap the iterations per epoch. `--max_val_iters` also limits the test pass. If a capped val subset has no positives for a criterion, that criterion's AP and recall are `nan`, and the means are taken over the criteria that are defined.
+
+```bash
+WANDB_MODE=offline python3 train_safe.py --config config/SwinCVS_safe_finetune_frozen.yaml \
+  --batch_size 1 --val_batch_size 2 --num_workers 2 --epochs 1 \
+  --max_train_iters 6 --max_val_iters 54 --output_dir /tmp/safe_smoke
+```
+
+---
+
 ## Repository layout (additions in this fork)
 
 - `download_weights.py` — explicit setup-time weights download (calls the same `verify_results_weights_folder` used implicitly by `SwinCVS.py` / `inference.py`).
@@ -222,7 +287,15 @@ For every row with `is_ds_keyframe == True`, the 4 immediately preceding rows in
 - `config/infer.yaml` — Endoscapes inference config. `MODEL.E2E` was removed in favour of the `--mode` CLI flag; `WEIGHTS_E2E`/`WEIGHTS_FROZEN` added so `--mode` can select the right weights file.
 - `config/infer_safe.yaml` — SAFE inference config, same `--mode`/weights convention, `CSV_PATH` + `VIDEO_ROOT` instead of `CSV_PATH` + `IMAGES_PATH`.
 
-Everything else (`SwinCVS.py`, `scripts/m_swinv2.py`, `scripts/m_swincvs.py`, `scripts/f_build.py`, `scripts/f_training*.py`, `scripts/f_environment.py`, `scripts/f_metrics.py`, `config/SwinCVS_config.yaml`) is unmodified from upstream.
+- `train_safe.py`: SAFE fine-tuning entry point, described above.
+- `config/SwinCVS_safe_finetune_e2e.yaml` and `config/SwinCVS_safe_finetune_frozen.yaml`: the SAFE fine-tuning configs.
+- `scripts/f_dataset_safe.py` also contains the labelled SAFE fine-tuning datasets (`get_safe_datasets` and the sequence-consistent augmentation). The 5-frame window logic and the transform are shared helpers (`build_safe_sequences`, `build_safe_transform`), so inference and training preprocess frames identically. Inference behaviour is unchanged.
+- `scripts/f_build.py`: `build_finetune_model` (strict full-checkpoint init via `MODEL.INIT_WEIGHTS`).
+- `scripts/f_training_utils.py`: `NativeScalerWithGradNormCount(enabled=...)`, so AMP can be turned off. The default behaviour is unchanged.
+- `scripts/f_metrics.py`: zero-division guards. A recall, specificity or AP with no positives or no negatives is `nan`, and the means skip it.
+- `SwinCVS.py`: fixed the printed "Average balanced accuracy", which averaged `C1 + C1 + C3` instead of `C1 + C2 + C3`.
+
+Everything else (`scripts/m_swinv2.py`, `scripts/m_swincvs.py`, `scripts/f_environment.py`, `config/SwinCVS_config.yaml`) is unmodified from upstream.
 
 ## Citation
 

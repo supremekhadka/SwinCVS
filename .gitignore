@@ -7,3 +7,4 @@ SwinLSTMend2endraw_inference.qsub.sh
 testins.ipynb
 
 **/__pycache__
+/work_dirs
