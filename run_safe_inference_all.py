@@ -43,6 +43,10 @@ RUNS = [
     "frozen",
 ]
 
+slug_dir = {
+    "e2e": "swincvs_end-to-end",
+    "frozen": "swincvs_frozen"
+}
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -79,7 +83,7 @@ def plan_runs(sync_modes, inference):
 
 
 def run(slug, sync_mode, throughput_only):
-    out_dir = OUT_BASE / slug
+    out_dir = OUT_BASE / slug_dir[slug] / SPLIT
     out_dir.mkdir(parents=True, exist_ok=True)
 
     task = "throughput" if throughput_only else "inference + throughput"

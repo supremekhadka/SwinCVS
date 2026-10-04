@@ -60,7 +60,7 @@ TRAIN:
     NAME: 'cosine'                     # 'cosine' (per-step, with linear warmup) or 'none' (constant)
     WARMUP_EPOCHS: 1
     MIN_LR_RATIO: 0.01                 # final lr = lr * MIN_LR_RATIO
-  POS_WEIGHT: null                     # null = neg/pos per class from the SAFE train split; or [w1, w2, w3]
+  POS_WEIGHT: [5.86734693877551, 24.68702290076336, 12.406374501992032]   # C1, C2, C3; null = neg/pos per class from the train split
   MULTICLASSIFIER_ALPHA: 0.6           # weight of the fc_swin loss; 0.6 = value at the end of the original 10-epoch schedule
   MULTICLASSIFIER_ALPHA_DECAY: False   # True = original schedule (alpha -= 0.04 per epoch after epoch 5)
   MAX_ITERS_PER_EPOCH: null            # debugging / smoke tests: limit train iterations per epoch
