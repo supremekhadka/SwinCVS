@@ -16,7 +16,7 @@ for), so it never costs an extra pass.
     ./run_safe_inference_all.py --throughput frame        # frame sync throughput only
     ./run_safe_inference_all.py --throughput video        # video sync throughput only
     ./run_safe_inference_all.py --inference --throughput video
-The output-dir machine tag is auto-detected (jetson_orin_nano / nitro5_1650ti); override with: MACHINE_TAG=my_gpu ./run_safe_inference_all.py
+The output-dir machine tag is auto-detected (jetson_orin_nano / macbook_m5_pro / nitro5_1650ti); override with: MACHINE_TAG=my_gpu ./run_safe_inference_all.py
 """
 
 import argparse
@@ -26,8 +26,13 @@ import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent
-# Jetson (L4T) ships /etc/nv_tegra_release; anything else is the Nitro 5 / GTX 1650 Ti.
-DEFAULT_MACHINE_TAG = "jetson_orin_nano" if Path("/etc/nv_tegra_release").exists() else "nitro5_1650ti"
+# Jetson (L4T) ships /etc/nv_tegra_release; macOS is the MacBook M5 Pro; anything else is the Nitro 5 / GTX 1650 Ti.
+if Path("/etc/nv_tegra_release").exists():
+    DEFAULT_MACHINE_TAG = "jetson_orin_nano"
+elif sys.platform == "darwin":
+    DEFAULT_MACHINE_TAG = "macbook_m5_pro"
+else:
+    DEFAULT_MACHINE_TAG = "nitro5_1650ti"
 MACHINE_TAG = os.environ.get("MACHINE_TAG", DEFAULT_MACHINE_TAG)
 SPLIT = "all"
 OUT_BASE = REPO_ROOT / "outputs" / "pretrained" / MACHINE_TAG / "safe" 

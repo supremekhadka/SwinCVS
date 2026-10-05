@@ -39,6 +39,43 @@ pip install -r requirements.txt
   ```
   This fetches the same weights zip that `SwinCVS.py` and `inference.py` would otherwise download implicitly on first run (see `verify_results_weights_folder` in `scripts/f_environment.py`), plus `SwinCVS_frozen_ENDP_sd5_bestMAP.pt` from [Hugging Face](https://huggingface.co/supremekhadka/SwinCVS), and extracts/places them into `weights/`. Running it during setup avoids a large, silent download the first time you kick off training or inference — those scripts still check for the weights and will download them if missing, but you shouldn't need to rely on that anymore.
 
+### Setup on macOS (Apple silicon)
+
+Target: MacBook Pro M5 Pro. `inference.py` runs on the GPU through
+PyTorch's MPS backend, which is picked automatically when CUDA is absent.
+Training (`SwinCVS.py`, `train_safe.py`) is CUDA-only and not supported here.
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install torch torchvision   # plain PyPI; the macOS wheels include MPS
+pip install -r requirements.txt
+python -c "import torch; print(torch.__version__, torch.backends.mps.is_available())"
+python3 download_weights.py
+```
+
+`run_safe_inference_all.py` writes to `outputs/pretrained/macbook_m5_pro/` on macOS.
+
+Power comes from `powermetrics`, which needs root. The scripts call it with
+`sudo -n` (no password prompt), so allow it once:
+
+```bash
+echo "$USER ALL=(root) NOPASSWD: /usr/bin/powermetrics" | sudo tee /etc/sudoers.d/powermetrics
+sudo chmod 440 /etc/sudoers.d/powermetrics
+```
+
+Without this, a warning is printed and `power_w` stays empty; everything else
+still runs.
+
+On the Mac, `inference_time_ms` uses `torch.mps.Event` timing (the MPS
+counterpart of the CUDA events), and the sync points use
+`torch.mps.synchronize()`. `memory_mb` is `torch.mps.current_allocated_memory()`
+(tensor memory held on the GPU, like `torch.cuda.memory_allocated`). MPS has no
+peak counter, so `peak_memory_mb` is the maximum of the 0.2 s samples and of
+per-module readings taken during the warm-up passes; keep `--warmup` above 0.
+`power_w` is the `GPU Power` estimate from `powermetrics` (GPU only, modelled
+by macOS rather than measured on a power rail). For comparable numbers, run
+plugged in with Low Power Mode off.
+
 ### Setup on Jetson Orin Nano
 
 The desktop install above (conda + a fixed pytorch-cuda build) doesn't apply on Jetson — PyTorch/torchvision there are tied to the JetPack version, not a generic CUDA version, so check your JetPack version first and match the Python and PyTorch versions to it rather than following the versions above.
@@ -113,7 +150,7 @@ Inference always runs at batch size 1 so per-frame timing is exact; batching wou
 
 For SAFE, `VIDEO_ROOT`/`CSV_PATH` (`config/infer_safe.yaml`) are the 1fps-sampled frames and CSV. This differs from the `cvs`/`CVS-AdaptNet` repos, which use the 5fps frames: here, every prediction needs the 4 frames immediately preceding the keyframe to build its input sequence, and only `metadata_1fps.csv` marks keyframes (`is_ds_keyframe`), so 5fps sampling wouldn't give a valid contiguous window.
 
-To run both modes on SAFE in one go, use `run_safe_inference_all.py`. It writes to `outputs/pretrained/<device>/safe/all/<mode>/` (`<device>` is auto-detected as `jetson_orin_nano` or `nitro5_1650ti`; override with `MACHINE_TAG`). Select what to run with `--throughput` and `--inference`:
+To run both modes on SAFE in one go, use `run_safe_inference_all.py`. It writes to `outputs/pretrained/<device>/safe/all/<mode>/` (`<device>` is auto-detected as `jetson_orin_nano`, `macbook_m5_pro` or `nitro5_1650ti`; override with `MACHINE_TAG`). Select what to run with `--throughput` and `--inference`:
 
 ```bash
 ./run_safe_inference_all.py                                # inference + frame and video sync (default)

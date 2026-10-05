@@ -18,17 +18,17 @@ predictions unless --throughput_only, writing under --output_dir:
 
 - result.csv (endoscapes: also metrics.json with mAP / balanced accuracy);
   not written with --throughput_only.
-- throughput/framesync.csv (--sync_mode frame): CUDA is synchronized after
+- throughput/framesync.csv (--sync_mode frame): the GPU (CUDA/MPS) is synchronized after
   every frame. One row per frame: vid_id, vid, frame, inference_time_ms,
   latency_time_ms.
-- throughput/videosync.csv (--sync_mode video): CUDA is synchronized only
+- throughput/videosync.csv (--sync_mode video): the GPU is synchronized only
   before and after each video. One row per video with totals and
   total / num_frames.
 - resources/<mode>sync/peak.csv, resources/<mode>sync/resource.csv: GPU-only
   peak and sampled memory/power over the whole run, see
   scripts/resource_monitor.py.
 
-inference_time_ms is the model forward only (CUDA events, under
+inference_time_ms is the model forward only (CUDA/MPS events, under
 torch.inference_mode()); latency_time_ms runs from dataset loading/transform
 to the end of postprocessing (sigmoid, copy to CPU) after a final sync.
 
@@ -154,11 +154,17 @@ def load_config(args):
     return config
 
 
-def timed_forward(model, sample, is_cuda):
-    """Model forward only, bracketed by CUDA events (perf_counter on CPU), no synchronize."""
-    if is_cuda:
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
+def device_backend(device):
+    """torch.cuda / torch.mps for a GPU device (event timing, synchronize), None on CPU."""
+    device_type = torch.device(device).type
+    return {"cuda": torch.cuda, "mps": torch.mps}.get(device_type)
+
+
+def timed_forward(model, sample, backend):
+    """Model forward only, bracketed by CUDA/MPS events (perf_counter on CPU), no synchronize."""
+    if backend is not None:
+        start = backend.Event(enable_timing=True)
+        end = backend.Event(enable_timing=True)
         start.record()
         out = model(sample)
         end.record()
@@ -168,9 +174,9 @@ def timed_forward(model, sample, is_cuda):
     return out, start, time.perf_counter()
 
 
-def elapsed_ms(start, end, is_cuda):
-    """Read a timed_forward pair; for CUDA events the end event must have completed."""
-    return start.elapsed_time(end) if is_cuda else (end - start) * 1000.0
+def elapsed_ms(start, end, backend):
+    """Read a timed_forward pair; for CUDA/MPS events the end event must have completed."""
+    return start.elapsed_time(end) if backend is not None else (end - start) * 1000.0
 
 
 def throughput_records(vid_id, vid, frames, inference_times_ms, latency_time_ms):
@@ -214,11 +220,11 @@ def run_video_pass(model, dataset, device, meta_df, has_targets, sync_mode):
     targets, throughput_df) with probs/targets in dataset order and one
     throughput row per `vid`.
     """
-    is_cuda = device.startswith("cuda")
+    backend = device_backend(device)
 
     def synchronize():
-        if is_cuda:
-            torch.cuda.synchronize()
+        if backend is not None:
+            backend.synchronize()
 
     def preprocess(idx):
         item = dataset[idx]  # preprocessing happens here, on the main thread
@@ -241,24 +247,24 @@ def run_video_pass(model, dataset, device, meta_df, has_targets, sync_mode):
                 inference_times_ms, latency_time_ms = [], []
                 for idx in indices:
                     t_frame_start = time.perf_counter()
-                    out, start, end = timed_forward(model, preprocess(idx), is_cuda)
+                    out, start, end = timed_forward(model, preprocess(idx), backend)
                     probs[idx] = torch.sigmoid(out).to("cpu")
                     synchronize()
                     latency_time_ms.append((time.perf_counter() - t_frame_start) * 1000.0)
-                    inference_times_ms.append(elapsed_ms(start, end, is_cuda))
+                    inference_times_ms.append(elapsed_ms(start, end, backend))
             else:
                 timings, outputs = [], []
                 synchronize()
                 t_video_start = time.perf_counter()
                 for idx in indices:
-                    out, start, end = timed_forward(model, preprocess(idx), is_cuda)
+                    out, start, end = timed_forward(model, preprocess(idx), backend)
                     timings.append((start, end))
                     outputs.append(out)
                 for idx, out in zip(indices, outputs):
                     probs[idx] = torch.sigmoid(out).to("cpu")
                 synchronize()
                 latency_time_ms = (time.perf_counter() - t_video_start) * 1000.0
-                inference_times_ms = [elapsed_ms(start, end, is_cuda) for start, end in timings]
+                inference_times_ms = [elapsed_ms(start, end, backend) for start, end in timings]
 
         rows.extend(
             throughput_records(
@@ -272,7 +278,7 @@ def run_video_pass(model, dataset, device, meta_df, has_targets, sync_mode):
     return probs, targets, pd.DataFrame(rows)
 
 
-def warmup_model(model, dataset, device, n_warmup):
+def warmup_model(model, dataset, device, n_warmup, resource_monitor):
     """
     Run `n_warmup` forward passes (batch size 1, untimed, predictions discarded)
     before the real run, to warm up CUDA kernels/caches so the first few timed
@@ -287,13 +293,14 @@ def warmup_model(model, dataset, device, n_warmup):
 
     n_warmup = min(n_warmup, len(dataset))
     print(f"Warming up with {n_warmup} sample(s)...")
-    with torch.inference_mode():
+    with torch.inference_mode(), resource_monitor.track_peak(model):
         for idx in range(n_warmup):
             item = dataset[idx]
             sample = item[0] if isinstance(item, (list, tuple)) else item
             model(sample.unsqueeze(0).to(device, non_blocking=True))
-    if device.startswith("cuda"):
-        torch.cuda.synchronize()
+    backend = device_backend(device)
+    if backend is not None:
+        backend.synchronize()
     print("Warmup complete.")
 
 
@@ -335,7 +342,7 @@ def run_endoscapes(config, args, model, device, output_dir):
 
     resource_monitor = ResourceMonitor(torch.device(device))
     resource_monitor.start()
-    warmup_model(model, dataset, device, args.warmup)
+    warmup_model(model, dataset, device, args.warmup, resource_monitor)
     probs, targets, throughput_df = run_video_pass(
         model, dataset, device, meta_df, has_targets=True, sync_mode=args.sync_mode
     )
@@ -380,7 +387,7 @@ def run_safe(config, args, model, device, output_dir):
 
     resource_monitor = ResourceMonitor(torch.device(device))
     resource_monitor.start()
-    warmup_model(model, dataset, device, args.warmup)
+    warmup_model(model, dataset, device, args.warmup, resource_monitor)
     probs, _, throughput_df = run_video_pass(
         model, dataset, device, meta_df, has_targets=False, sync_mode=args.sync_mode
     )
@@ -409,7 +416,12 @@ def main():
 
     set_deterministic_behaviour(config.SEED)
 
-    device = f"cuda:{config.CUDA_ID}" if torch.cuda.is_available() else "cpu"
+    if torch.cuda.is_available():
+        device = f"cuda:{config.CUDA_ID}"
+    elif torch.backends.mps.is_available():
+        device = "mps"
+    else:
+        device = "cpu"
     print(f"Using device: {device}")
     print(f"Dataset: {args.dataset} | Mode: {args.mode}")
 
