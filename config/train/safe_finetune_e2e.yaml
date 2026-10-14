@@ -46,7 +46,7 @@ TRAIN:
   EPOCHS: 10
   LAST_LAYERS: null                    # N = train only the last N backbone layers (Swin blocks / patch merging, counted from
                                        # the output; 1 = layers.3.blocks.1 + final norm); heads always train. null = train everything
-  BATCH_SIZE: 2
+  BATCH_SIZE: 4
   ACCUMULATION_STEPS: 2                # effective batch 4 (= original training batch size)
   NUM_WORKERS: 8
   AMP: True
@@ -59,7 +59,7 @@ TRAIN:
     ENCODER_LR: 0.000005               # backbone + fc_swin; original Endoscapes training: 1e-5
     CLASSIFIER_LR: 0.0001              # original Endoscapes training: 1e-3
   LR_SCHEDULER:
-    NAME: 'cosine'                     # 'cosine' (per-step, with linear warmup) or 'none' (constant)
+    NAME: 'none'                     # 'cosine' (per-step, with linear warmup) or 'none' (constant)
     WARMUP_EPOCHS: 1
     MIN_LR_RATIO: 0.01                 # final lr = lr * MIN_LR_RATIO
   POS_WEIGHT: [5.86734693877551, 24.68702290076336, 12.406374501992032]   # C1, C2, C3; null = neg/pos per class from the train split
@@ -68,15 +68,15 @@ TRAIN:
   MAX_ITERS_PER_EPOCH: null            # debugging / smoke tests: limit train iterations per epoch
 
 VAL:
-  BATCH_SIZE: 4                        # no backward pass, so larger than train
+  BATCH_SIZE: 8                        # no backward pass, so larger than train
   MAX_ITERS: null                      # debugging / smoke tests: limit val iterations
 
 TEST:
-  ENABLE: False                        # evaluate best checkpoint on the test split at the end (also --eval_test)
+  ENABLE: True                        # evaluate best checkpoint on the test split at the end (also --eval_test)
 
 WANDB:
   ENABLE: True
-  PROJECT: safe-cvs-finetune
+  PROJECT: safe-swincvs
   ENTITY: null
   RUN_NAME: null                       # null = EXPERIMENT_NAME
   TAGS: ['e2e']

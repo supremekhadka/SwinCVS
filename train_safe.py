@@ -398,7 +398,7 @@ def main():
     config = load_config(args)
     set_deterministic_behaviour(config.SEED)
 
-    device = torch.device(config.DEVICE if (not config.DEVICE.startswith("cuda") or torch.cuda.is_available()) else "cpu")
+    device = torch.device(config.DEVICE if (config.DEVICE.startswith("cuda") and torch.cuda.is_available()) else "cpu")
     print(f"Using device: {device}")
 
     run_name = config.WANDB.RUN_NAME

@@ -259,11 +259,11 @@ For every row with `is_ds_keyframe == True`, the 4 immediately preceding rows in
 | Frozen | `config/SwinCVS_safe_finetune_frozen.yaml` | `SwinCVS_frozen_ENDP_sd5_bestMAP.pt` | LSTM, `fc_lstm` (backbone frozen) |
 
 ```bash
-python3 train_safe.py --config config/SwinCVS_safe_finetune_e2e.yaml
-python3 train_safe.py --config config/SwinCVS_safe_finetune_frozen.yaml
+python3 train_safe.py --config config/train/safe_finetune_e2e.yaml
+python3 train_safe.py --config config/train/safe_finetune_frozen.yaml
 
 # common overrides
-python3 train_safe.py --config config/SwinCVS_safe_finetune_frozen.yaml \
+python3 train_safe.py --config config/train/safe_finetune_frozen.yaml \
   --data_root /path/to/SAFE --device cuda:0 --epochs 20 --batch_size 8 --num_workers 8 \
   --eval_test --opts TRAIN.OPTIMIZER.CLASSIFIER_LR 5e-5 DATA.AUGMENT.ENABLE False
 ```
