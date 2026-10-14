@@ -25,6 +25,11 @@ counted backwards from the output down to patch_embed, the final norm coming alo
 last block. The heads (LSTM, fc_lstm, fc_swin) always train; 0 = whole backbone frozen.
 MODEL.FROZEN_BACKBONE_EVAL then puts the frozen backbone layers in eval mode.
 null = the config's own setup (whole model for E2E, LSTM + fc_lstm for frozen).
+
+Full-backbone warmup: TRAIN.FULL_WARMUP_EPOCHS / --full_warmup_epochs W (requires LAST_LAYERS)
+trains the whole model (backbone included, even for the frozen variant) for the first W epochs,
+then freezes the backbone except its last LAST_LAYERS layers for the remaining epochs. The
+optimizer state of the newly frozen parameters is dropped at the switch.
 """
 
 print("Importing libraries...")
@@ -77,6 +82,9 @@ def parse_args():
     parser.add_argument("--train_last_layers", type=int, default=None,
                         help="Freeze the backbone except its last N layers (Swin blocks / patch merging, counted "
                              "from the output; 0 = all frozen); the heads always train. Overrides TRAIN.LAST_LAYERS")
+    parser.add_argument("--full_warmup_epochs", type=int, default=None,
+                        help="Train the whole backbone for the first N epochs, then freeze it except the last "
+                             "TRAIN.LAST_LAYERS layers. Overrides TRAIN.FULL_WARMUP_EPOCHS")
     parser.add_argument("--max_train_iters", type=int, default=None, help="Limit train iterations per epoch")
     parser.add_argument("--max_val_iters", type=int, default=None, help="Limit val (and test) iterations")
     parser.add_argument("--eval_test", action="store_true", help="Evaluate the best checkpoint on the test split")
@@ -102,6 +110,7 @@ def load_config(args):
         "VAL.BATCH_SIZE": args.val_batch_size,
         "TRAIN.NUM_WORKERS": args.num_workers,
         "TRAIN.LAST_LAYERS": args.train_last_layers,
+        "TRAIN.FULL_WARMUP_EPOCHS": args.full_warmup_epochs,
         "SEED": args.seed,
         "TRAIN.MAX_ITERS_PER_EPOCH": args.max_train_iters,
         "VAL.MAX_ITERS": args.max_val_iters,
@@ -139,10 +148,24 @@ def load_config(args):
     config.MODEL.INFERENCE = False
     if config.TRAIN.get("LAST_LAYERS") is not None and config.TRAIN.LAST_LAYERS < 0:
         raise ValueError(f"TRAIN.LAST_LAYERS must be >= 0 or null, got {config.TRAIN.LAST_LAYERS}")
+    warmup = config.TRAIN.get("FULL_WARMUP_EPOCHS") or 0
+    if warmup < 0:
+        raise ValueError(f"TRAIN.FULL_WARMUP_EPOCHS must be >= 0, got {warmup}")
+    if warmup:
+        if config.TRAIN.get("LAST_LAYERS") is None:
+            raise ValueError("TRAIN.FULL_WARMUP_EPOCHS needs TRAIN.LAST_LAYERS (the layers kept trainable after the warmup)")
+        if config.TRAIN.OPTIMIZER.ENCODER_LR <= 0:
+            raise ValueError(f"TRAIN.FULL_WARMUP_EPOCHS trains the backbone, but TRAIN.OPTIMIZER.ENCODER_LR is "
+                             f"{config.TRAIN.OPTIMIZER.ENCODER_LR}: set it > 0 (e.g. --opts TRAIN.OPTIMIZER.ENCODER_LR 5e-6)")
+        if warmup >= config.TRAIN.EPOCHS:
+            print(f"WARNING: TRAIN.FULL_WARMUP_EPOCHS={warmup} >= TRAIN.EPOCHS={config.TRAIN.EPOCHS}: "
+                  f"the backbone is never frozen")
     if not config.WANDB.RUN_NAME:
         config.WANDB.RUN_NAME = config.EXPERIMENT_NAME
         if config.TRAIN.get("LAST_LAYERS") is not None:
             config.WANDB.RUN_NAME += f"_last{config.TRAIN.LAST_LAYERS}"
+        if warmup:
+            config.WANDB.RUN_NAME += f"_warm{warmup}"
     config.freeze()
     return config
 
@@ -226,6 +249,27 @@ def apply_last_layers(config, model):
           f"output first: {[g[0] for g in trained]}")
     print(f"Trainable parameters: {n_trainable:,} / {n_total:,}")
     return [m for _, _, modules in frozen for m in modules]
+
+
+def unfreeze_all(model):
+    """Full-backbone warmup: everything trains. Returns an empty frozen-module list, so that
+    MODEL.FROZEN_BACKBONE_EVAL leaves the backbone in train mode during the warmup."""
+    for p in model.parameters():
+        p.requires_grad = True
+    n_total = sum(p.numel() for p in model.parameters())
+    print(f"Full-backbone warmup: training all {n_total:,} parameters")
+    return []
+
+
+def end_full_warmup(config, model, optimizer):
+    """Freeze the backbone except its last TRAIN.LAST_LAYERS layers and drop the grads / optimizer
+    state of the newly frozen parameters (AdamW skips params whose grad is None)."""
+    frozen_backbone = apply_last_layers(config, model)
+    for p in model.parameters():
+        if not p.requires_grad:
+            p.grad = None
+            optimizer.state.pop(p, None)
+    return frozen_backbone
 
 
 def build_lr_scheduler(config, optimizer, steps_per_epoch):
@@ -417,7 +461,9 @@ def main():
 
     # MODEL
     model = build_finetune_model(config)
-    frozen_backbone = apply_last_layers(config, model)
+    warmup_epochs = config.TRAIN.get("FULL_WARMUP_EPOCHS") or 0
+    # The optimizer below holds every backbone param, so the warmup -> partial switch needs no rebuild
+    frozen_backbone = unfreeze_all(model) if warmup_epochs else apply_last_layers(config, model)
     model.to(device)
 
     # LOSS: pos_weight = neg/pos per class on the SAFE train split
@@ -453,6 +499,9 @@ def main():
         start_time = time.time()
         if uses_multiclassifier(config) and config.TRAIN.MULTICLASSIFIER_ALPHA_DECAY:
             alpha, _ = update_params(alpha, 1 - alpha, epoch)
+        if warmup_epochs and epoch == warmup_epochs:
+            print(f"End of the {warmup_epochs}-epoch full-backbone warmup")
+            frozen_backbone = end_full_warmup(config, model, optimizer)
 
         train_log, global_step = train_one_epoch(
             config, model, train_loader, criterion, optimizer, loss_scaler, lr_scheduler,
