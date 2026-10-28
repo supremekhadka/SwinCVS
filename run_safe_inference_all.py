@@ -37,7 +37,7 @@ MACHINE_TAG = os.environ.get("MACHINE_TAG", DEFAULT_MACHINE_TAG)
 SPLIT = "all"
 OUT_BASE = REPO_ROOT / "outputs" / "pretrained" / MACHINE_TAG / "safe" 
 
-CONFIG = "config/infer_safe.yaml"  # SAFE 1fps csv/frames: SwinCVS needs the is_ds_keyframe
+CONFIG = "config/inference/infer_safe.yaml"  # SAFE 1fps csv/frames: SwinCVS needs the is_ds_keyframe
                                    # flag and 4 contiguous preceding frames per keyframe, which
                                    # only the 1fps csv provides (no 5fps equivalent).
 WARMUP = "10"
